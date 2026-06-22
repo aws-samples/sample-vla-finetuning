@@ -1,0 +1,27 @@
+# CDK / Node
+node_modules/
+cdk.out/
+cdk.context.json
+*.js
+!jest.config.js
+*.d.ts
+*.tsbuildinfo
+.cdk.staging/
+
+# IDE / editors
+.vscode/
+.idea/
+
+# Python (lambdas / converters)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build / local
+build/
+dist/
+*.log
+.DS_Store
+.env
+.temp/
