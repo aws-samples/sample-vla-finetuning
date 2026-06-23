@@ -1,6 +1,11 @@
 # vla-ft MCP — self-serve VLA fine-tuning for requesting CC sessions
 
-**Status**: design (no code yet). Decided 2026-06-20 with the user.
+**Status**: **v1 built & live-verified** (2026-06-20) — 7 tools in [`../mcp/`](../mcp/),
+`test_mcp.py` 43/43, verified against a live RUNNING job and the real GR00T checkpoint gate.
+See [`../mcp/README.md`](../mcp/README.md) for the as-built surface. This doc is the
+*design rationale*; the sections below describe the design as decided, and the
+"Open questions — RESOLVED" block at the end records how v1 shipped. Decided 2026-06-20
+with the user.
 **Goal (user's words)**: a research/task CC session must be able to fine-tune a VLA **without the
 user acting as a manual relay** — "여기 데이터 있으니 저기 checkpoint 확인해봐라" 중간 개입 없이,
 의뢰 세션이 직접 submit·조회·checkpoint 확인. So the MCP surface is defined **from the requesting

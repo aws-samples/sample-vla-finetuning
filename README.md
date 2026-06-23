@@ -181,6 +181,28 @@ Step Functions orchestrator (`lib/orchestrator/`, built as code + synth, deploy-
 The launcher and the orchestrator import the **same** `vla_ft_decide` module, so the
 backend pick can never diverge between the two paths.
 
+### Spot reclaim: resume, not restart
+
+This is the concrete reason to reach for `vla-ft` over a self-managed
+Slurm/ParallelCluster cluster you already run: **you do not hand-write the requeue/resume
+launcher.** Spot is on by default, and a reclaim is recovered automatically, but the
+*mechanism differs by backend* and the *maturity differs too* — stated honestly:
+
+- **Pattern A (Batch)** — the container checkpoints to **EFS**; on a Spot reclaim Batch
+  retries the job and the launcher resumes from the latest checkpoint on EFS rather than
+  step 0. This path is **wired and a real run finished SUCCEEDED**; the mid-run
+  reclaim→resume *transition itself* was not separately forced (the verified run completed
+  before a reclaim), so treat the resume path as wired, not reclaim-proven.
+- **Pattern B (SageMaker)** — uses SageMaker **Managed Spot Training**, where checkpoint
+  upload/restore is native to the service. This is **code-complete but not yet
+  deploy-verified** inside `vla-ft`.
+
+Either way the platform owns the resume wiring. On a self-managed Slurm/ParallelCluster
+cluster, Spot interruption handling, requeue, and checkpoint-restore are **yours to build
+and maintain** — that DIY launcher is exactly what this removes. (Checkpointing itself is
+always the training script's job — saving to S3/EFS/FSx — on any backend; what `vla-ft`
+adds is the *resume-on-reclaim wiring* around it.)
+
 ## Repository layout
 
 ```
@@ -196,7 +218,7 @@ pai-training-platform/          (product: vla-ft)
 │   ├── vla-ft/                the verified LeRobot VLA FT container (the IL engine);
 │   │                            also holds vla_ft_decide / cli + orchestrator plan/submit Lambdas
 │   └── isaac-lab-rl/          Isaac Lab RL container (headless PPO via rsl_rl)
-├── mcp/                       optional MCP server — submit / monitor / read-back from an agent session
+├── mcp/                       optional MCP server (built, 7 tools) — submit / monitor / checkpoint-verify from an agent session
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
 
@@ -221,17 +243,29 @@ verified vs designed.
 ## How it compares
 
 `vla-ft` is not "another training pipeline." It combines four things that the existing AWS
-robot-learning assets do not bundle together:
+robot-learning assets do not bundle together. Each axis below carries its **maturity
+inline** — capability is not the same as verified, and the [Status](#status) section has
+the full per-component breakdown:
 
 - **Ease** — one command, smart defaults, pre-flight checks; no hand-written launcher.
+  *(built, dry-run-validated; live `--yes` submit is the remaining check.)*
 - **Efficiency** — Spot + AZ-selection + instance auto-sizing + early-stop, on by default,
-  with a cost estimate *before* you launch.
-- **Coverage** — IL *and* RL behind one entry point.
+  with a cost estimate *before* you launch. And when Spot reclaims the instance the job
+  **resumes from the last checkpoint** instead of restarting — so you never hand-write the
+  requeue/resume launcher a self-managed Slurm/ParallelCluster cluster makes you own
+  (Pattern A wires this and a real run finished SUCCEEDED; Pattern B's managed-spot resume
+  is code-complete, not yet deploy-verified — see [Spot reclaim: resume, not restart](#spot-reclaim-resume-not-restart)).
+- **Coverage** — IL *and* RL behind one entry point. *(IL Pattern A verified end-to-end;
+  RL is code-complete but not yet run on a GPU — built, not delivered.)*
 - **Backend flexibility** — the same intent runs on Batch, SageMaker Training Job, or
-  HyperPod (A/B/C), with override.
+  HyperPod (A/B/C), with override. *(A verified; B code-complete, deploy pending; C code +
+  `cdk synth` only.)*
 
 [`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md) has the honest prior-art comparison —
-including where this overlaps existing AWS samples and where it genuinely differs.
+including where this overlaps existing AWS samples and where it genuinely differs. If you
+already run a **self-managed ParallelCluster / Slurm** cluster (or operate across clouds),
+[§6.1](docs/ARCHITECTURE.md) spells out what `vla-ft` adds and, just as honestly, what it
+does not (it is AWS-only and not a ParallelCluster replacement).
 
 ### When it fits — and when it's overkill
 
@@ -268,7 +302,11 @@ This README does not oversell. The same caveats are tracked in
   positioning, the two paths (IL / RL), the three backends, the optional orchestrator,
   ingest, the asset-reuse map, prior-art differentiation, and key decisions.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased build plan and per-phase verification level.
-- [`docs/MCP-DESIGN.md`](docs/MCP-DESIGN.md) — the optional MCP server design.
+- [`docs/MCP-DESIGN.md`](docs/MCP-DESIGN.md) — the optional MCP server design rationale.
+  The server is **built and live-verified** (v1, 7 tools — `submit_finetune`,
+  `get_job_status` ("is it *really* learning?"), `describe_checkpoint` (export-consistency
+  gate), `list/get_job`, `register/list_checkpoints`); see [`mcp/README.md`](mcp/README.md)
+  for the as-built surface and how to register it.
 
 ## Naming
 

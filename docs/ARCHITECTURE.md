@@ -286,6 +286,52 @@ reinvention; the prior-art survey preceded the build.
   differentiator is the four-axis bundle above; the orchestrator is one way to scale the
   Ease axis, not the reason to exist.
 
+### 6.1 vs a self-managed ParallelCluster / Slurm (and cross-cloud) operator
+
+The prior-art table above is vs AWS samples. A different and increasingly common reader
+already runs **self-managed EC2 ParallelCluster + Slurm**, often **across clouds**
+(e.g. nebius / Azure for price or capacity arbitrage). For them the honest framing is not
+"vla-ft is better" — it is **what vla-ft adds, and what it does not**.
+
+A few facts first, so the comparison is grounded and not FUD (verified against AWS docs,
+2026-06-23):
+
+- **Control plane is $0 on both HyperPod and ParallelCluster** — you pay only for the EC2
+  GPU capacity either way. So "self-managed PC is cheaper because there's no managed
+  control-plane fee" is **false**; the real cost lever is Spot/instance-sizing/teardown
+  discipline, which is exactly what vla-ft defaults.
+- **HyperPod managed Spot resilience is EKS-only.** The managed Spot interruption
+  handling announced 2025-11 ("up to 90%") and the managed node auto-recovery / health
+  agent (GA for Slurm 2025-09-15) are HyperPod features, **not Slurm-on-ParallelCluster
+  features**. On self-managed PC, Spot interruption handling, requeue, and node-health
+  replacement are **yours to build and operate.** vla-ft does *not* deliver these through
+  HyperPod-Slurm either — its resume story is **Batch retry (Pattern A) and SageMaker
+  Managed Spot (Pattern B)**, which is a different mechanism, stated in §3 / the README.
+
+**What vla-ft adds for a PC/Slurm operator:**
+- **One-command backend auto-select** — it picks Batch / SM Training Job / HyperPod +
+  instance for a given job instead of you maintaining a hand-tuned Slurm submit script per
+  model size.
+- **Defaulted Spot economics** — Spot on, AZ-capacity probe, instance auto-size,
+  early-stop, and a **pre-launch cost estimate** — the levers a self-managed cluster
+  exposes but does not default.
+- **Resume-on-reclaim wiring you don't author** — the requeue/checkpoint-restore around a
+  Spot reclaim is owned by the platform (Pattern A wired + a real run SUCCEEDED; Pattern B
+  managed-spot code-complete), not a launcher you hand-write and maintain.
+- **MCP self-serve** — an agent/research session can submit, check "is it really
+  learning?", and read back a consistency-checked checkpoint without a human relaying
+  order docs (see [`MCP-DESIGN.md`](MCP-DESIGN.md)).
+
+**What vla-ft does NOT add (do not oversell):**
+- **It is AWS-only.** It is **not a cross-cloud arbitrage replacement** — if you run on
+  nebius/Azure for price or capacity, vla-ft does not span those; it makes the AWS leg
+  easier, it does not unify your multi-cloud fleet.
+- **It is not a ParallelCluster replacement.** If you already operate a tuned, trusted
+  PC/Slurm pipeline, vla-ft is a *different abstraction* (managed Batch/SM schedulers),
+  not a drop-in migration — and it does not give you Slurm semantics (gang scheduling,
+  job arrays, fair-share). The "skip it when…" guidance in the README applies directly:
+  a single fixed pipeline you trust does not need this.
+
 ---
 
 ## 7. Key decisions
