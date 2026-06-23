@@ -83,6 +83,14 @@ INSTANCES: dict[str, Instance] = {
 # bigger than this can't run under accelerate DDP → needs FSDP/HyperPod (Pattern C).
 MAX_SINGLE_GPU_MEM_GB = 48
 
+# Pattern A Spot CE GPU floor. The Spot Compute Environment lists g6e.4xlarge (L40S
+# 48 GB) primary → g5.4xlarge (A10G 24 GB) fallback, and Batch may place a Spot job on
+# EITHER depending on capacity — there is NO per-job instance-type override in Batch, so
+# a replica > this floor can silently land on the 24 GB g5 and OOM at step 0 (the
+# 2026-06-23 pi05 full-VLM failure). The On-Demand CE is narrowed to L40S-only (48 GB),
+# so the safe answer when a replica exceeds this floor is to route to On-Demand.
+SPOT_GPU_FLOOR_GB = 24
+
 # Spot discount factor for the estimate. Anchored to the REAL Pattern A run
 # (g6e.4xl Spot, 2026-06-15: ~$0.20 for ~12.7 min RUNNING ⇒ ~$0.94/hr ⇒ ~31 % of
 # the $3.004 OD). Spot fluctuates (~30–60 % of OD typically); we use ~0.35 and
@@ -293,6 +301,19 @@ def decide(
     num_gpus = instance.gpus if instance else 1
     per_device_batch = max(1, round(EFF_BATCH / num_gpus))
     sm_instance_type = f"ml.{instance_type}" if pattern == "B" else ""
+
+    # ── GPU-floor guard (Pattern A only): keep a too-big replica off the 24 GB g5 ──
+    # Batch picks the instance from the CE list (no per-job override), so a Spot job whose
+    # replica exceeds the Spot CE's g5 fallback floor can OOM at step 0. The On-Demand CE
+    # is L40S-only (48 GB), so auto-route there instead of letting Spot gamble on capacity.
+    # This is a smart default (not a cage): an explicit instance_override is left untouched.
+    if pattern == "A" and spot and not instance_override and vram > SPOT_GPU_FLOOR_GB:
+        spot = False
+        notes.append(
+            f"per-GPU replica ~{vram:.0f} GB > {SPOT_GPU_FLOOR_GB} GB (the Spot CE's g5 "
+            f"fallback) — auto-routed to the On-Demand queue (L40S-only, 48 GB) so Batch "
+            f"can't place it on a 24 GB g5 and OOM at step 0. Pass spot=True + a smaller "
+            f"footprint (expert_only / LoRA) to stay on Spot.")
 
     # ── cost estimate ──
     if instance:

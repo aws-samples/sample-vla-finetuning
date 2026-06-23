@@ -62,6 +62,7 @@ STACK_RL_PATTERN_A = "PaiTrainingPlatform-RL-PatternA"
 # is a placeholder for an externally-published sample.
 VERIFIED_DATASET_S3 = "s3://example-openarm-lift-dataset/lerobot_dataset/"
 # Gated PaliGemma (pi-family) HF token — SSM SecureString param holding your HF token.
+# Override with --hf-token-ssm; the param must exist in --hf-token-ssm-region.
 DEFAULT_HF_TOKEN_SSM = "/pai/hf-token"
 DEFAULT_HF_TOKEN_SSM_REGION = "us-east-1"
 DEFAULT_REGION = "us-west-2"

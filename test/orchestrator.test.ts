@@ -12,9 +12,16 @@ const ENV = { account: '111111111111', region: 'us-west-2' };
 // The orchestrator is deploy-gated (NOT in bin/app.ts, like the HyperPod stacks), so
 // this synth IS the gate: it proves the Step Functions state machine + the two Lambdas
 // wire up against the real pattern stacks. Cost 0.
+// Returns { orch, base } templates so tests can assert the shared topic lives on Base
+// (the single owner) while the orchestrator only references it as an SnsPublish target.
 function build() {
   const app = new cdk.App();
-  const base = new SharedBaseStack(app, 'TestBase', { env: ENV, namePrefix: 'pai' });
+  // notifyEmail on BASE → that's where the shared topic + email subscription live now.
+  const base = new SharedBaseStack(app, 'TestBase', {
+    env: ENV,
+    namePrefix: 'pai',
+    notifyEmail: 'you@example.com',
+  });
   const ilA = new PatternAStack(app, 'TestIlA', { env: ENV, namePrefix: 'pai', base });
   const ilB = new PatternBStack(app, 'TestIlB', { env: ENV, namePrefix: 'pai', base });
   const rlA = new RlPatternAStack(app, 'TestRlA', { env: ENV, namePrefix: 'pai', base });
@@ -29,11 +36,13 @@ function build() {
     grootPatternA: grootA,
     notifyEmail: 'you@example.com',
   });
-  return Template.fromStack(orch);
+  return { orch: Template.fromStack(orch), base: Template.fromStack(base) };
 }
 
 describe('OrchestratorStack', () => {
-  const t = build();
+  const built = build();
+  const t = built.orch;
+  const baseT = built.base;
 
   test('synthesizes a Step Functions state machine', () => {
     t.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
@@ -68,6 +77,7 @@ describe('OrchestratorStack', () => {
     // Pattern B (SageMaker handoff).
     for (const k of [
       'IL_A_JOB_QUEUE',
+      'IL_A_JOB_QUEUE_OD', // On-Demand queue for per-job spot=false (no redeploy)
       'IL_A_JOB_DEFINITION',
       'IL_A_CODE_S3',
       'IL_A_OUTPUT_S3',
@@ -115,13 +125,16 @@ describe('OrchestratorStack', () => {
     expect(def).toContain('$.runnable');
   });
 
-  test('outcome + failure notifications publish to one SNS topic', () => {
-    t.resourceCountIs('AWS::SNS::Topic', 1);
-    // The state machine references SnsPublish targets; the email subscription is created.
-    t.hasResourceProperties('AWS::SNS::Subscription', {
+  test('outcome + failure notifications publish to the shared Base-owned SNS topic', () => {
+    // The topic + email subscription live on Base (one owner, no fixed-name collision).
+    baseT.resourceCountIs('AWS::SNS::Topic', 1);
+    baseT.hasResourceProperties('AWS::SNS::Subscription', {
       Protocol: 'email',
       Endpoint: 'you@example.com',
     });
+    // The orchestrator imports that topic for its SnsPublish targets — it owns none itself.
+    t.resourceCountIs('AWS::SNS::Topic', 0);
+    t.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   });
 
   test('exposes the state machine ARN as an output', () => {

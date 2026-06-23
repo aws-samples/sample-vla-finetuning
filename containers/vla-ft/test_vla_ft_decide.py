@@ -342,6 +342,130 @@ def test_orchestrator():
     check("--batch-size 4" in cmd, "submit: handoff per-device batch = decision (eff-batch lock)")
 
 
+# ── Per-job timeout + dual-queue spot/od (the MCP-only-FT controls) ──────────────────────
+def test_per_job_controls():
+    """timeout_hours and spot are resolved PER JOB (no redeploy): the plan normalizes them
+    into the submit dict, orchestrator_submit turns timeout_s into the SubmitJob `timeout`
+    kwarg and selects the Spot vs On-Demand queue. Covers all three Batch engines."""
+    print("per-job timeout + dual-queue (no-redeploy controls):")
+    import orchestrator_plan as op
+    import orchestrator_submit as osub
+    import os
+
+    # plan(): timeout_hours → submit.timeout_s (seconds), surfaced in plan_text. Omit → None.
+    p_to = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 20000, "timeout_hours": 24})
+    check(p_to["submit"]["timeout_s"] == 86400, f"plan: timeout_hours=24 → 86400 s (got {p_to['submit']['timeout_s']})")
+    check("timeout" in p_to["plan_text"] and "24 h" in p_to["plan_text"],
+          "plan: per-job timeout shown in plan_text")
+    check(op.plan({"dataset": "s3://b", "timeout_s": 3600})["submit"]["timeout_s"] == 3600,
+          "plan: raw timeout_s passes through")
+    check(op.plan({"dataset": "s3://b", "timeout_hours": 0.001})["submit"]["timeout_s"] == 60,
+          "plan: tiny timeout floored at Batch's 60 s minimum")
+    p_none = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200})
+    check(p_none["submit"]["timeout_s"] is None, "plan: no timeout → submit.timeout_s None (JobDef default)")
+    check("timeout    :" not in p_none["plan_text"], "plan: no timeout line when unset")
+    # RL + GR00T carry the same knob.
+    check(op.plan({"task": "Isaac-Velocity-Rough-H1-v0", "timeout_hours": 3})["submit"]["timeout_s"] == 10800,
+          "plan: RL carries timeout_s")
+    check(op.plan({"dataset": "s3://b", "embodiment_tag": "UNITREE_G1", "timeout_hours": 2})["submit"]["timeout_s"] == 7200,
+          "plan: GR00T carries timeout_s")
+
+    # _timeout_kwarg: SubmitJob shape, or {} to inherit the JobDef default.
+    check(osub._timeout_kwarg({"timeout_s": 86400}) == {"timeout": {"attemptDurationSeconds": 86400}},
+          "submit: timeout_s → SubmitJob timeout.attemptDurationSeconds")
+    check(osub._timeout_kwarg({"timeout_s": None}) == {} and osub._timeout_kwarg({}) == {},
+          "submit: no timeout_s → no timeout kwarg (JobDef default inherited)")
+
+    # _submit_il_batch: spot selects the queue (Spot default vs On-Demand), and timeout_s
+    # flows into SubmitJob. Intercept boto3 (no live AWS), capture the call.
+    os.environ["IL_A_JOB_QUEUE"] = "arn:aws:batch:us-west-2:428:job-queue/il-spot"
+    os.environ["IL_A_JOB_QUEUE_OD"] = "arn:aws:batch:us-west-2:428:job-queue/il-od"
+    os.environ["IL_A_JOB_DEFINITION"] = "arn:aws:batch:us-west-2:428:job-definition/il:7"
+    os.environ["IL_A_CODE_S3"] = "s3://pai-artifacts/vla-ft-code/train.py"
+    os.environ["IL_A_OUTPUT_S3"] = "s3://pai-artifacts/vla-ft"
+    os.environ.pop("HF_TOKEN_SSM", None)  # skip the HF read on this IL path
+
+    captured = {}
+
+    class _FakeS3:
+        def upload_file(self, *a, **k): pass
+        def put_object(self, **k): pass
+
+    class _FakeBatch:
+        def submit_job(self, **kw):
+            captured.clear(); captured.update(kw)
+            return {"jobId": "fake-il-id"}
+
+    class _FakeSession:
+        region_name = "us-west-2"
+        def client(self, name, region_name=None):
+            return _FakeBatch() if name == "batch" else _FakeS3()
+
+    base_submit = {"policy": "pi05", "dataset_s3": "s3://b/ds/", "steps": 20000,
+                   "per_device_batch": 16, "num_gpus": 1, "expert_only": False}
+
+    # spot=False → On-Demand queue + timeout flows through.
+    out_od = osub._submit_il_batch(_FakeSession(), "us-west-2",
+                                   {**base_submit, "spot": False, "timeout_s": 86400}, want_hf=False)
+    check(captured["jobQueue"].endswith("/il-od"), "submit: spot=False → On-Demand queue")
+    check(captured.get("timeout") == {"attemptDurationSeconds": 86400}, "submit: timeout_s reaches SubmitJob")
+    check(out_od["queue"] == "on-demand", "submit: return labels queue 'on-demand'")
+
+    # spot=True (default) → Spot queue + no timeout kwarg when unset.
+    out_sp = osub._submit_il_batch(_FakeSession(), "us-west-2", {**base_submit, "spot": True}, want_hf=False)
+    check(captured["jobQueue"].endswith("/il-spot"), "submit: spot=True → Spot queue")
+    check("timeout" not in captured, "submit: no timeout_s → no timeout kwarg (JobDef default)")
+    check(out_sp["queue"] == "spot", "submit: return labels queue 'spot'")
+
+    # Missing OD output (older stack) → graceful fall back to the Spot queue for spot=False.
+    os.environ.pop("IL_A_JOB_QUEUE_OD", None)
+    osub._submit_il_batch(_FakeSession(), "us-west-2", {**base_submit, "spot": False}, want_hf=False)
+    check(captured["jobQueue"].endswith("/il-spot"),
+          "submit: spot=False with no OD queue → falls back to Spot (no crash)")
+    os.environ["IL_A_JOB_QUEUE_OD"] = "arn:aws:batch:us-west-2:428:job-queue/il-od"  # restore
+
+
+def test_gpu_floor_guard():
+    """A full-VLM replica (~40 GB) must NOT ride the Spot CE, whose g5 fallback (24 GB)
+    OOMs it at step 0 — Batch has no per-job instance override, so the decision auto-routes
+    such a run to the On-Demand (L40S-only) queue. Expert-only / LoRA (≤24 GB) stay on Spot,
+    and an explicit instance_override is never second-guessed."""
+    print("GPU-floor guard (full-VLM off the 24 GB Spot fallback):")
+
+    # The guard is Pattern-A-only (the dual-queue tier). The Af7-2 launch path forces
+    # backend=batch (Pattern A); without an override a long full-VLM run routes to Pattern B
+    # (SageMaker, which picks its own instance — no g5 OOM risk), so the guard correctly
+    # only matters when the user pins Batch.
+    p_full = dec.profile_run("pi05", 20000, "full_ft")
+    check(p_full.vram_per_gpu_gb > dec.SPOT_GPU_FLOOR_GB,
+          f"pi05 full_ft replica {p_full.vram_per_gpu_gb} GB > {dec.SPOT_GPU_FLOOR_GB} GB floor")
+
+    # pi05 full_vlm on Batch, spot=True → guard flips to On-Demand (the real Af7-2 recipe).
+    _, d_full = _run("pi05", 20000, full_vlm=True, spot=True, backend_override="batch")
+    check(d_full.pattern == "A", "backend=batch full-VLM → Pattern A")
+    check(d_full.spot is False, "pi05 full_vlm (39.6 GB) on Batch auto-routed OFF Spot → On-Demand")
+    check(any("On-Demand queue" in n and "24 GB" in n for n in d_full.notes),
+          "guard explains the auto-route in notes")
+
+    # expert-only (~22.6 GB ≤ 24 GB) fits the g5 fallback → stays on Spot.
+    _, d_exp = _run("pi05", 20000, full_vlm=False, spot=True, backend_override="batch")
+    check(d_exp.spot is True, "pi05 expert-only (22.6 GB ≤ 24 GB) stays on Spot")
+
+    # smolvla (0.45B × 12 = 5.4 GB) trivially fits → Spot.
+    _, d_small = _run("smolvla", 20000, spot=True, backend_override="batch")
+    check(d_small.spot is True, "smolvla (small) stays on Spot")
+
+    # An explicit instance_override is honored, not overridden by the guard.
+    _, d_ovr = _run("pi05", 20000, full_vlm=True, spot=True, backend_override="batch",
+                    instance_override="g6e.4xlarge")
+    check(d_ovr.spot is True, "explicit instance_override left on Spot (user wins, not caged)")
+
+    # spot=False already → guard is a no-op (no spurious note).
+    _, d_od = _run("pi05", 20000, full_vlm=True, spot=False, backend_override="batch")
+    check(d_od.spot is False and not any("auto-routed" in n for n in d_od.notes),
+          "spot=False full-VLM: no redundant guard note")
+
+
 # ── GR00T axis: classify + profile/decide + plan/submit faithfulness vs gr00t_launch.py ──
 def test_groot():
     print("GR00T axis (NVIDIA Isaac-GR00T N1.7):")
@@ -456,7 +580,8 @@ def test_groot():
 
 def main():
     for t in (test_rule_table, test_overrides, test_lora, test_cost_anchor, test_budget,
-              test_cli_argv, test_cli_rl_argv, test_orchestrator, test_groot):
+              test_cli_argv, test_cli_rl_argv, test_orchestrator, test_per_job_controls,
+              test_gpu_floor_guard, test_groot):
         t()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

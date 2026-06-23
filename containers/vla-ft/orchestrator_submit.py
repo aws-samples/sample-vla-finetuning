@@ -52,6 +52,16 @@ def _split_s3(uri: str):
     return bucket, key
 
 
+def _timeout_kwarg(submit: dict) -> dict:
+    """SubmitJob `timeout` kwarg from the plan's per-job `timeout_s`, or {} to inherit the
+    JobDefinition default. Batch's `timeout.attemptDurationSeconds` overrides the JobDef's
+    Timeout PER JOB with no redeploy — the whole point of this knob (each FT has a different
+    expected wall-clock; the fixed 18 h JobDef default once SIGKILLed a healthy ~19 h run one
+    step short). Identical shape for all three Batch engines (IL / RL / GR00T)."""
+    t = submit.get("timeout_s")
+    return {"timeout": {"attemptDurationSeconds": int(t)}} if t else {}
+
+
 # ── HF token (read here, inject as container env — never into SFN history) ──────────
 def _read_hf_token(session, ssm_name: str | None, ssm_region: str | None):
     """Read the gated-backbone HF token from SSM. Mirrors batch_launch.py / launch.py:
@@ -67,7 +77,15 @@ def _read_hf_token(session, ssm_name: str | None, ssm_region: str | None):
 def _submit_il_batch(session, region: str, submit: dict, *, want_hf: bool) -> dict:
     import boto3  # noqa: F401  (runtime-provided; imported for clarity / local runs)
 
-    queue = _env("IL_A_JOB_QUEUE")
+    # Per-job Spot vs On-Demand: pick the queue, NOT a CE property (CEs can't switch
+    # capacity type per job). spot=True (default) → the Spot queue; spot=False → the
+    # On-Demand queue (reclaim-free long run). Both are deployed once (idle = 0 vCPU = $0);
+    # switching needs no redeploy. IL_A_JOB_QUEUE_OD falls back to the Spot queue if an
+    # older stack predates the dual-queue wiring, so spot=False degrades gracefully.
+    queue_spot = _env("IL_A_JOB_QUEUE")
+    queue_od = _env("IL_A_JOB_QUEUE_OD") or queue_spot
+    use_spot = submit.get("spot", True)
+    queue = queue_spot if use_spot else queue_od
     jobdef = _env("IL_A_JOB_DEFINITION")
     code_s3 = _env("IL_A_CODE_S3")
     output_s3 = _env("IL_A_OUTPUT_S3")
@@ -162,9 +180,11 @@ def _submit_il_batch(session, region: str, submit: dict, *, want_hf: bool) -> di
     resp = session.client("batch", region_name=region).submit_job(
         jobName=job_name, jobQueue=queue, jobDefinition=jobdef,
         containerOverrides=container_overrides,
+        **_timeout_kwarg(submit),
     )
     return {"status": "submitted", "backend": "batch", "axis": "il",
             "job_name": job_name, "job_id": resp["jobId"],
+            "queue": "spot" if use_spot else "on-demand",
             "output_s3": f"{output_s3.rstrip('/')}/{job_name}/output/"}
 
 
@@ -208,6 +228,7 @@ def _submit_rl_batch(session, region: str, submit: dict) -> dict:
     resp = session.client("batch", region_name=region).submit_job(
         jobName=job_name, jobQueue=queue, jobDefinition=jobdef,
         containerOverrides=container_overrides,
+        **_timeout_kwarg(submit),
     )
     return {"status": "submitted", "backend": "batch", "axis": "rl",
             "job_name": job_name, "job_id": resp["jobId"],
@@ -265,6 +286,7 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
     resp = session.client("batch", region_name=region).submit_job(
         jobName=job_name, jobQueue=queue, jobDefinition=jobdef,
         containerOverrides=container_overrides,
+        **_timeout_kwarg(submit),
     )
     return {"status": "submitted", "backend": "batch", "axis": "gr00t",
             "job_name": job_name, "job_id": resp["jobId"],

@@ -144,17 +144,11 @@ export class PatternBStack extends cdk.Stack {
     // A SageMaker Training Job is not a CFN resource, so its completion can't be
     // observed by this stack directly. EventBridge emits a state-change event we
     // route to SNS → email. Created only when an address is supplied.
-    if (props.notifyEmail) {
+    if (base.notificationTopic) {
       this.notifications = new TrainingNotifications(this, 'Notifications', {
-        namePrefix,
-        notifyEmail: props.notifyEmail,
+        topic: base.notificationTopic,
       });
       this.notifications.addSageMakerTrainingJobRule(props.notifyJobNamePrefix ?? 'vla-ft-');
-
-      new cdk.CfnOutput(this, 'NotificationTopicArn', {
-        value: this.notifications.topic.topicArn,
-        description: 'SNS topic for training-job terminal-state notifications',
-      });
     }
 
     // --- Outputs: everything launch.py needs, in one place ---

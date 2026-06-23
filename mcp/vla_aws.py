@@ -17,7 +17,7 @@ not a rewrite:
 
 
 Stack output keys (verified against vla_ft_cli.py's resolver):
-  IL Pattern A : PaiTrainingPlatform-IL-PatternA       → JobQueueArn JobDefinitionArn CodeS3Hint OutputS3Hint
+  IL Pattern A : PaiTrainingPlatform-IL-PatternA       → JobQueueArn JobQueueArnOnDemand JobDefinitionArn CodeS3Hint OutputS3Hint
   RL Pattern A : PaiTrainingPlatform-RL-PatternA       → JobQueueArn JobDefinitionArn OutputS3Hint
   GR00T Ptn A  : PaiTrainingPlatform-IL-GrootPatternA  → JobQueueArn JobDefinitionArn OutputS3Hint
   Pattern B    : PaiTrainingPlatform-IL-PatternB       → ExecutionRoleArn ImageUriHint OutputS3Hint
@@ -41,6 +41,10 @@ if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 
 DEFAULT_REGION = "us-west-2"
+# Gated PaliGemma backbone (pi05/GR00T) HF token. The token is read on the SUBMITTING
+# side (orchestrator_submit._read_hf_token) and injected as job env — so dry_run never
+# reads it but a real submit does. Override with --hf-token-ssm / the hfTokenSsm context
+# value; the SSM SecureString must exist in HF_TOKEN_SSM_REGION before a real launch.
 DEFAULT_HF_TOKEN_SSM = "/pai/hf-token"
 DEFAULT_HF_TOKEN_SSM_REGION = "us-east-1"
 
@@ -90,6 +94,9 @@ def resolve_wiring(sess: boto3.Session, *, hf_token_ssm: str | None,
     a = safe(STACK_IL_A)
     if a:
         env["IL_A_JOB_QUEUE"] = a.get("JobQueueArn", "")
+        # On-Demand queue for per-job spot=False (reclaim-free long run). Falls back to the
+        # Spot queue if an older stack predates the dual-queue output, so submit never breaks.
+        env["IL_A_JOB_QUEUE_OD"] = a.get("JobQueueArnOnDemand", "") or a.get("JobQueueArn", "")
         env["IL_A_JOB_DEFINITION"] = a.get("JobDefinitionArn", "")
         env["IL_A_CODE_S3"] = a.get("CodeS3Hint", "")
         env["IL_A_OUTPUT_S3"] = a.get("OutputS3Hint", "")

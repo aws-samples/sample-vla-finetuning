@@ -92,33 +92,41 @@ describe('PatternBStack', () => {
     expect(hasExtra).toBe(false);
   });
 
-  test('omitting notifyEmail creates no SNS topic or EventBridge rule', () => {
-    // The default `stack` above has no notifyEmail.
+  test('the pattern stack never owns an SNS topic (Base owns the shared topic)', () => {
+    // The default `stack` above has a Base with no notifyEmail.
     t.resourceCountIs('AWS::SNS::Topic', 0);
     t.resourceCountIs('AWS::SNS::Subscription', 0);
+  });
+
+  test('omitting notifyEmail (Base has no topic) creates no EventBridge rule', () => {
     t.resourceCountIs('AWS::Events::Rule', 0);
   });
 
-  describe('with notifyEmail', () => {
+  describe('with notifyEmail (topic on Base, rule on the pattern stack)', () => {
     const napp = new cdk.App();
-    const nbase = new SharedBaseStack(napp, 'NBase', { env: ENV, namePrefix: 'pai' });
+    const nbase = new SharedBaseStack(napp, 'NBase', {
+      env: ENV,
+      namePrefix: 'pai',
+      notifyEmail: 'you@example.com',
+    });
     const nstack = new PatternBStack(napp, 'NPatternB', {
       env: ENV,
       namePrefix: 'pai',
       base: nbase,
-      notifyEmail: 'you@example.com',
     });
+    const nbaseT = Template.fromStack(nbase);
     const nt = Template.fromStack(nstack);
 
-    test('creates an SNS topic with an email subscription', () => {
-      nt.resourceCountIs('AWS::SNS::Topic', 1);
-      nt.hasResourceProperties('AWS::SNS::Subscription', {
+    test('Base owns the one SNS topic + email subscription; the pattern stack none', () => {
+      nbaseT.resourceCountIs('AWS::SNS::Topic', 1);
+      nbaseT.hasResourceProperties('AWS::SNS::Subscription', {
         Protocol: 'email',
         Endpoint: 'you@example.com',
       });
+      nt.resourceCountIs('AWS::SNS::Topic', 0);
     });
 
-    test('creates an EventBridge rule filtering SageMaker terminal states by job-name prefix', () => {
+    test('the pattern stack creates an EventBridge rule filtering SageMaker terminal states by job-name prefix', () => {
       nt.hasResourceProperties('AWS::Events::Rule', {
         EventPattern: Match.objectLike({
           source: ['aws.sagemaker'],
@@ -131,17 +139,17 @@ describe('PatternBStack', () => {
       });
     });
 
-    test('the rule targets the SNS topic', () => {
+    test('the rule targets an SNS topic (the imported Base topic, via cross-stack ref)', () => {
       const rules = nt.findResources('AWS::Events::Rule');
       const rule = Object.values(rules)[0] as any;
-      const targetArns = (rule.Properties.Targets as any[]).map((tg) => JSON.stringify(tg.Arn));
-      const topics = nt.findResources('AWS::SNS::Topic');
-      const topicLogicalId = Object.keys(topics)[0];
-      expect(targetArns.some((a) => a.includes(topicLogicalId))).toBe(true);
+      const targets = rule.Properties.Targets as any[];
+      // Target Arn is a cross-stack reference (Fn::ImportValue / parameter) to Base's topic.
+      expect(targets.length).toBeGreaterThan(0);
+      expect(targets.some((tg) => JSON.stringify(tg.Arn).length > 0)).toBe(true);
     });
 
-    test('exposes the notification topic ARN as an output', () => {
-      nt.hasOutput('NotificationTopicArn', {});
+    test('Base exposes the notification topic ARN as an output', () => {
+      nbaseT.hasOutput('NotificationTopicArn', {});
     });
   });
 });

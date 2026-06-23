@@ -13,49 +13,39 @@
  * managed EventBridge + SNS, no Lambda/poller.
  *
  * Reusable across patterns: `addSageMakerTrainingJobRule()` wires the SageMaker
- * source now; a `addBatchJobRule()` sibling can route Pattern A / RL Batch jobs to
- * the same topic later without a second email subscription.
+ * source; `addBatchJobRule()` routes Pattern A / RL Batch jobs to the same topic.
+ *
+ * ★ Single topic owner: the SNS topic is created ONCE in the Base stack and passed in
+ * here (props.topic). An earlier version created a fixed-name topic per stack, which
+ * collided (AWS::SNS::Topic AlreadyExists) as soon as a second stack also got notifyEmail
+ * — e.g. Pattern B (SageMaker) and Pattern A (Batch) both notifying. Importing the shared
+ * topic keeps one subscription and lets every pattern add only its own EventBridge rule.
  *
  * Cost is ~0: SNS + EventBridge are per-message priced and a few job completions a
  * day is negligible. The email subscription requires a one-time confirmation click
  * (AWS sends a "Subscription Confirmation" email on first deploy).
  */
-import * as cdk from 'aws-cdk-lib';
 import * as sns from 'aws-cdk-lib/aws-sns';
-import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 
 export interface TrainingNotificationsProps {
-  /** Prefix for the topic's physical name. Default 'pai'. */
-  readonly namePrefix?: string;
   /**
-   * Email address to subscribe to the topic. If omitted, the topic is still
-   * created (so rules can attach) but no subscription is made — useful when a
-   * caller wires the topic into other targets, or defers the email to a later
-   * deploy via `-c notifyEmail=...`.
+   * The shared SNS topic to route alerts to — created once in the Base stack and
+   * imported by each pattern stack (base.notificationTopic). Owning the topic in one
+   * place is what prevents the fixed-name AlreadyExists collision across stacks.
    */
-  readonly notifyEmail?: string;
+  readonly topic: sns.ITopic;
 }
 
 export class TrainingNotifications extends Construct {
-  /** Topic that all training-job terminal-state events publish to. */
-  public readonly topic: sns.Topic;
+  /** Topic that all training-job terminal-state events publish to (owned by Base). */
+  public readonly topic: sns.ITopic;
 
-  constructor(scope: Construct, id: string, props: TrainingNotificationsProps = {}) {
+  constructor(scope: Construct, id: string, props: TrainingNotificationsProps) {
     super(scope, id);
-
-    const prefix = props.namePrefix ?? 'pai';
-
-    this.topic = new sns.Topic(this, 'Topic', {
-      topicName: `${prefix}-training-notifications`,
-      displayName: 'PAI Training Platform',
-    });
-
-    if (props.notifyEmail) {
-      this.topic.addSubscription(new subs.EmailSubscription(props.notifyEmail));
-    }
+    this.topic = props.topic;
   }
 
   /**
@@ -107,7 +97,11 @@ export class TrainingNotifications extends Construct {
    * terminal states. The queue-ARN filter keeps alerts to this stack's queue (the
    * account is SMUS-shared), and the name-prefix mirrors the SageMaker rule.
    */
-  addBatchJobRule(jobQueueArn: string, jobNamePrefix: string): events.Rule {
+  addBatchJobRule(jobQueueArn: string | string[], jobNamePrefix: string): events.Rule {
+    // Accept one queue ARN or several (a stack may own a Spot + On-Demand queue pair, and a
+    // job lands on whichever was selected at SubmitJob). The EventBridge `jobqueue` filter
+    // is a match-any list, so one rule covers all of them.
+    const jobqueue = Array.isArray(jobQueueArn) ? jobQueueArn : [jobQueueArn];
     const rule = new events.Rule(this, 'BatchJobRule', {
       description:
         `Route Batch job terminal states (queue, name prefix "${jobNamePrefix}") to ${this.topic.topicName}`,
@@ -115,7 +109,7 @@ export class TrainingNotifications extends Construct {
         source: ['aws.batch'],
         detailType: ['Batch Job State Change'],
         detail: {
-          jobqueue: [jobQueueArn],
+          jobqueue,
           jobName: events.Match.prefix(jobNamePrefix),
           status: ['FAILED', 'SUCCEEDED'],
         },

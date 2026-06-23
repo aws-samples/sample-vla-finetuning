@@ -82,6 +82,11 @@ def parse_args():
     p.add_argument("--output-s3", required=True, help="PatternA OutputS3Hint output (model lands here).")
     p.add_argument("--num-gpus", type=int, default=1,
                    help="GPUs to train across on the node. Pattern A is single-GPU tier; default 1.")
+    p.add_argument("--timeout-hours", type=float, default=None,
+                   help="Per-job wall-clock ceiling (Batch SIGKILLs the attempt at the limit). "
+                        "Overrides the Job Definition default for THIS job only, no redeploy. "
+                        "Omit = the deployed JobDefinition default. Size to the run (~19 h for a "
+                        "single-L40S 20000-step full-VLM FT; ~2 h for a short probe).")
     p.add_argument("--region", default=None)
     p.add_argument("--job-name", default=None, help="Override the auto job name.")
 
@@ -218,11 +223,21 @@ def main():
     if resource_overrides:
         container_overrides["resourceRequirements"] = resource_overrides
 
+    # Per-job attempt timeout (overrides the JobDefinition default; floored at Batch's 60 s
+    # minimum). Omit --timeout-hours → no timeout kwarg → the JobDefinition default applies.
+    submit_kwargs = {}
+    if args.timeout_hours is not None:
+        submit_kwargs["timeout"] = {
+            "attemptDurationSeconds": max(60, int(round(args.timeout_hours * 3600)))}
+        print(f"  timeout   : {args.timeout_hours} h "
+              f"({submit_kwargs['timeout']['attemptDurationSeconds']} s, overrides JobDef default)")
+
     resp = sess.client("batch", region_name=region).submit_job(
         jobName=job_name,
         jobQueue=args.job_queue,
         jobDefinition=args.job_definition,
         containerOverrides=container_overrides,
+        **submit_kwargs,
     )
     print(f"Submitted Batch job id: {resp['jobId']}")
     print(f"Track: aws batch describe-jobs --jobs {resp['jobId']} --region {region} "

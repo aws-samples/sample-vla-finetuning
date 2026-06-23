@@ -256,17 +256,11 @@ export class RlPatternAStack extends cdk.Stack {
     });
 
     // --- Job-completion notifications (opt-in) — Batch job-state-change rule. ---
-    if (props.notifyEmail) {
+    if (base.notificationTopic) {
       this.notifications = new TrainingNotifications(this, 'Notifications', {
-        namePrefix,
-        notifyEmail: props.notifyEmail,
+        topic: base.notificationTopic,
       });
       this.notifications.addBatchJobRule(this.jobQueue.jobQueueArn, props.notifyJobNamePrefix ?? 'isaac-rl-');
-
-      new cdk.CfnOutput(this, 'NotificationTopicArn', {
-        value: this.notifications.topic.topicArn,
-        description: 'SNS topic for Batch job terminal-state notifications',
-      });
     }
 
     // --- Outputs: everything rl_launch.py needs. ---

@@ -43,6 +43,11 @@ const notifyEmail = app.node.tryGetContext('notifyEmail') as string | undefined;
 // for a reclaim-free run (first E2E smoke / short runs with no checkpoint to resume).
 const rlUseSpot = app.node.tryGetContext('rlUseSpot') !== 'false';
 
+// IL Pattern A capacity is per-JOB, not per-deploy: PatternAStack always deploys BOTH a
+// Spot and an On-Demand queue (idle CEs cost nothing), and the launcher picks one at
+// submit time via the plan's spot flag. So there is no ilUseSpot deploy toggle anymore —
+// switching Spot↔On-Demand needs no redeploy.
+
 // GR00T Pattern A capacity: On-Demand by default (this single long fine-tune has no
 // EFS-resume, so a Spot reclaim would restart from scratch). `-c grootUseSpot=true` opts in.
 const grootUseSpot = app.node.tryGetContext('grootUseSpot') === 'true';
@@ -55,6 +60,10 @@ const env = {
 const base = new SharedBaseStack(app, 'PaiTrainingPlatform-Base', {
   env,
   namePrefix,
+  // The notification SNS topic is owned here (one per platform) so multiple pattern
+  // stacks can route to it without colliding on the fixed topic name. Pattern stacks
+  // import base.notificationTopic and add only their own EventBridge rule.
+  notifyEmail,
   description:
     'PAI Training Platform — shared base (VPC, EFS, ECR, S3, base IAM) for IL + RL training backends',
 });
@@ -77,7 +86,7 @@ new PatternAStack(app, 'PaiTrainingPlatform-IL-PatternA', {
   extraDatasetReadArns: ilExtraDatasetArns,
   notifyEmail,
   description:
-    'PAI Training Platform — IL Pattern A (AWS Batch + g6e Spot for the vla-ft container)',
+    'PAI Training Platform — IL Pattern A (AWS Batch + g6e for the vla-ft container)',
 });
 
 // IL Pattern B (SageMaker Training Job): execution role + launch wiring.

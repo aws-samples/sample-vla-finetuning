@@ -16,8 +16,10 @@ describe('PatternAStack', () => {
   });
   const t = Template.fromStack(stack);
 
-  test('creates a managed EC2 Batch compute environment on Spot', () => {
-    t.resourceCountIs('AWS::Batch::ComputeEnvironment', 1);
+  test('creates TWO managed EC2 Batch CEs — one Spot, one On-Demand (per-job switching)', () => {
+    // Spot vs On-Demand is a CE property, so per-job switching means deploying BOTH and
+    // selecting the queue at submit. Idle CEs scale to 0 vCPU, so the waiting one is free.
+    t.resourceCountIs('AWS::Batch::ComputeEnvironment', 2);
     t.hasResourceProperties('AWS::Batch::ComputeEnvironment', {
       Type: 'managed',
       ComputeResources: Match.objectLike({
@@ -26,18 +28,34 @@ describe('PatternAStack', () => {
         InstanceTypes: ['g6e.4xlarge', 'g5.4xlarge'],
       }),
     });
-  });
-
-  test('Spot CE defaults to SPOT_PRICE_CAPACITY_OPTIMIZED (Batch-native capacity strategy)', () => {
     t.hasResourceProperties('AWS::Batch::ComputeEnvironment', {
+      Type: 'managed',
       ComputeResources: Match.objectLike({
-        AllocationStrategy: 'SPOT_PRICE_CAPACITY_OPTIMIZED',
+        Type: 'EC2', // On-Demand
+        // L40S-only: the OD queue is the sanctioned full-VLM path (spot=false); a ~40 GB
+        // replica OOMs on a 24 GB g5, and BEST_FIT_PROGRESSIVE would otherwise pick it.
+        InstanceTypes: ['g6e.4xlarge'],
       }),
     });
   });
 
-  test('creates a job queue and a GPU job definition', () => {
-    t.resourceCountIs('AWS::Batch::JobQueue', 1);
+  test('Spot CE → SPOT_PRICE_CAPACITY_OPTIMIZED; On-Demand CE → BEST_FIT_PROGRESSIVE', () => {
+    t.hasResourceProperties('AWS::Batch::ComputeEnvironment', {
+      ComputeResources: Match.objectLike({
+        Type: 'SPOT',
+        AllocationStrategy: 'SPOT_PRICE_CAPACITY_OPTIMIZED',
+      }),
+    });
+    t.hasResourceProperties('AWS::Batch::ComputeEnvironment', {
+      ComputeResources: Match.objectLike({
+        Type: 'EC2',
+        AllocationStrategy: 'BEST_FIT_PROGRESSIVE',
+      }),
+    });
+  });
+
+  test('creates TWO job queues (Spot + On-Demand) sharing ONE GPU job definition', () => {
+    t.resourceCountIs('AWS::Batch::JobQueue', 2);
     t.resourceCountIs('AWS::Batch::JobDefinition', 1);
     t.hasResourceProperties('AWS::Batch::JobDefinition', {
       ContainerProperties: Match.objectLike({
@@ -48,11 +66,12 @@ describe('PatternAStack', () => {
     });
   });
 
-  test('the job definition timeout defaults to 18 h (covers single-GPU LoRA full-FT ~12.8 h, not the old 6 h)', () => {
-    // job ...151444 was a healthy run SIGKILLed at step 9000/20000 by a 6 h ceiling
-    // sized for the old multi-GPU expert-only regime. 18 h * 3600 = 64800 s.
+  test('the job definition timeout defaults to 28 h (covers the MEASURED single-L40S full-VLM ~19 h)', () => {
+    // The old 18 h ceiling SIGKILLed a healthy run at step 19000/20000 (~3.36 s/step on a
+    // single L40S ⇒ ~19 h). 28 h * 3600 = 100800 s gives headroom. Per-job timeout_hours
+    // overrides this at SubmitJob time (no redeploy); this is just the deployed default.
     t.hasResourceProperties('AWS::Batch::JobDefinition', {
-      Timeout: Match.objectLike({ AttemptDurationSeconds: 64800 }),
+      Timeout: Match.objectLike({ AttemptDurationSeconds: 100800 }),
       RetryStrategy: Match.objectLike({ Attempts: 2 }),
     });
   });
@@ -182,8 +201,9 @@ describe('PatternAStack', () => {
     expect(lt.Properties.LaunchTemplateData.ImageId).toBeUndefined();
   });
 
-  test('exposes the job queue + job definition ARNs as outputs', () => {
-    t.hasOutput('JobQueueArn', {});
+  test('exposes the Spot + On-Demand job queue ARNs + the job definition ARN as outputs', () => {
+    t.hasOutput('JobQueueArn', {});           // Spot (default, spot=true)
+    t.hasOutput('JobQueueArnOnDemand', {});   // On-Demand (spot=false, selected per-job)
     t.hasOutput('JobDefinitionArn', {});
   });
 
@@ -199,31 +219,43 @@ describe('PatternAStack', () => {
     expect(hasExtra).toBe(false);
   });
 
-  test('omitting notifyEmail creates no SNS topic or EventBridge rule', () => {
+  test('the pattern stack never owns an SNS topic (Base owns the shared topic)', () => {
+    // The topic moved to Base to avoid a fixed-name AlreadyExists collision when more
+    // than one stack notifies. The pattern stack only ever adds an EventBridge rule.
     t.resourceCountIs('AWS::SNS::Topic', 0);
+  });
+
+  test('omitting notifyEmail (Base has no topic) creates no EventBridge rule', () => {
     t.resourceCountIs('AWS::Events::Rule', 0);
   });
 
-  describe('with notifyEmail', () => {
+  describe('with notifyEmail (topic on Base, rule on the pattern stack)', () => {
     const napp = new cdk.App();
-    const nbase = new SharedBaseStack(napp, 'NBase', { env: ENV, namePrefix: 'pai' });
+    // notifyEmail goes to BASE — that's where the shared topic + subscription live now.
+    const nbase = new SharedBaseStack(napp, 'NBase', {
+      env: ENV,
+      namePrefix: 'pai',
+      notifyEmail: 'you@example.com',
+    });
     const nstack = new PatternAStack(napp, 'NPatternA', {
       env: ENV,
       namePrefix: 'pai',
       base: nbase,
-      notifyEmail: 'you@example.com',
     });
+    const nbaseT = Template.fromStack(nbase);
     const nt = Template.fromStack(nstack);
 
-    test('creates an SNS topic with an email subscription', () => {
-      nt.resourceCountIs('AWS::SNS::Topic', 1);
-      nt.hasResourceProperties('AWS::SNS::Subscription', {
+    test('Base owns the one SNS topic + email subscription', () => {
+      nbaseT.resourceCountIs('AWS::SNS::Topic', 1);
+      nbaseT.hasResourceProperties('AWS::SNS::Subscription', {
         Protocol: 'email',
         Endpoint: 'you@example.com',
       });
+      // The pattern stack imports the topic; it does not create its own.
+      nt.resourceCountIs('AWS::SNS::Topic', 0);
     });
 
-    test('creates an EventBridge rule filtering Batch terminal states', () => {
+    test('the pattern stack creates an EventBridge rule filtering Batch terminal states', () => {
       nt.hasResourceProperties('AWS::Events::Rule', {
         EventPattern: Match.objectLike({
           source: ['aws.batch'],

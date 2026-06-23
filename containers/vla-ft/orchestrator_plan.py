@@ -50,6 +50,22 @@ import dataclasses
 import vla_ft_decide as dec
 
 
+def _resolve_timeout_s(event: dict) -> int | None:
+    """Per-job Batch *attempt* timeout in seconds — or None to use the JobDefinition
+    default. This is the no-redeploy knob: Batch's SubmitJob `timeout.attemptDurationSeconds`
+    overrides the JobDefinition's `Timeout` per job (each FT has a different expected
+    wall-clock; the 18 h JobDef default once SIGKILLed a healthy 19 h run one step short).
+
+    Accepts `timeout_hours` (float — the MCP/CLI-friendly unit) or `timeout_s` (int).
+    Floors at Batch's 60 s minimum so a fat-fingered tiny value can't submit an instant-kill
+    job. Returns None when neither is set (downstream omits the override → JobDef default)."""
+    if event.get("timeout_s") is not None:
+        return max(60, int(event["timeout_s"]))
+    if event.get("timeout_hours") is not None:
+        return max(60, int(round(float(event["timeout_hours"]) * 3600)))
+    return None
+
+
 def _il_plan(event: dict) -> dict:
     """Profile + decide for an IL fine-tune. Pure passthrough to vla_ft_decide."""
     model = event.get("model") or "pi05"
@@ -96,6 +112,8 @@ def _il_plan(event: dict) -> dict:
         "val_episodes": event.get("val_episodes"),
         "save_freq": event.get("save_freq"),
         "early_stop_patience": event.get("early_stop_patience"),
+        # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
+        "timeout_s": _resolve_timeout_s(event),
     }
     return _envelope("il", profile, decision, submit, dec.format_plan(profile, decision))
 
@@ -139,6 +157,8 @@ def _groot_plan(event: dict) -> dict:
         "instance_type": decision.instance_type,
         "liveness_deadline_s": event.get("liveness_deadline_s"),
         "extra": event.get("extra") or [],
+        # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
+        "timeout_s": _resolve_timeout_s(event),
     }
     return _envelope("gr00t", profile, decision, submit,
                      dec.format_groot_plan(profile, decision))
@@ -174,6 +194,8 @@ def _rl_plan(event: dict) -> dict:
         "instance_type": decision.instance_type,
         "skip_export": bool(event.get("skip_export", False)),
         "overrides": event.get("overrides") or [],
+        # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
+        "timeout_s": _resolve_timeout_s(event),
     }
     return _envelope("rl", profile, decision, submit, _format_rl_plan(profile, decision))
 
@@ -182,6 +204,13 @@ def _envelope(axis: str, profile, decision, submit: dict, plan_text: str) -> dic
     """Assemble the state output. `runnable` is the deterministic gate the Choice state
     branches on: Pattern C is code+synth only, so the machine stops at a recommendation
     rather than attempting an un-deployed backend."""
+    # Surface the per-job attempt timeout in the plan text (it's a SubmitJob-time override,
+    # not part of the rule-table Decision, so format_plan can't show it). A dry_run caller
+    # then sees exactly how long this job may run before the JobDefinition default kicks in.
+    timeout_s = submit.get("timeout_s")
+    if timeout_s:
+        plan_text = f"{plan_text}\n  timeout    : {timeout_s / 3600:g} h " \
+                    f"({timeout_s} s, per-job override of the JobDefinition default)"
     return {
         "axis": axis,
         "pattern": decision.pattern,

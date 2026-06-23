@@ -220,31 +220,39 @@ describe('GrootPatternAStack', () => {
     t.hasOutput('ImageUriHint', {});
   });
 
-  test('omitting notifyEmail creates no SNS topic or EventBridge rule', () => {
+  test('the pattern stack never owns an SNS topic (Base owns the shared topic)', () => {
     t.resourceCountIs('AWS::SNS::Topic', 0);
+  });
+
+  test('omitting notifyEmail (Base has no topic) creates no EventBridge rule', () => {
     t.resourceCountIs('AWS::Events::Rule', 0);
   });
 
-  describe('with notifyEmail', () => {
+  describe('with notifyEmail (topic on Base, rule on the pattern stack)', () => {
     const napp = new cdk.App();
-    const nbase = new SharedBaseStack(napp, 'NBase', { env: ENV, namePrefix: 'pai' });
+    const nbase = new SharedBaseStack(napp, 'NBase', {
+      env: ENV,
+      namePrefix: 'pai',
+      notifyEmail: 'you@example.com',
+    });
     const nstack = new GrootPatternAStack(napp, 'NGrootPatternA', {
       env: ENV,
       namePrefix: 'pai',
       base: nbase,
-      notifyEmail: 'you@example.com',
     });
+    const nbaseT = Template.fromStack(nbase);
     const nt = Template.fromStack(nstack);
 
-    test('creates an SNS topic with an email subscription', () => {
-      nt.resourceCountIs('AWS::SNS::Topic', 1);
-      nt.hasResourceProperties('AWS::SNS::Subscription', {
+    test('Base owns the one SNS topic + email subscription; the pattern stack none', () => {
+      nbaseT.resourceCountIs('AWS::SNS::Topic', 1);
+      nbaseT.hasResourceProperties('AWS::SNS::Subscription', {
         Protocol: 'email',
         Endpoint: 'you@example.com',
       });
+      nt.resourceCountIs('AWS::SNS::Topic', 0);
     });
 
-    test('creates an EventBridge rule filtering Batch terminal states with the gr00t-n17- prefix', () => {
+    test('the pattern stack creates an EventBridge rule filtering Batch terminal states with the gr00t-n17- prefix', () => {
       nt.hasResourceProperties('AWS::Events::Rule', {
         EventPattern: Match.objectLike({
           source: ['aws.batch'],

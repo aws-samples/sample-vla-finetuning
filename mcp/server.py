@@ -98,6 +98,7 @@ def submit_finetune(
     early_stop_patience: int | None = None,
     budget_usd: float | None = None,
     spot: bool = True,
+    timeout_hours: float | None = None,
     job_name: str | None = None,
     region: str | None = None,
     dry_run: bool = True,
@@ -120,6 +121,17 @@ def submit_finetune(
     last checkpoint (after a timeout / Spot reclaim / host-termination) instead of starting
     from step 0. Keep every other arg identical to the original submit. Omit job_name → a
     fresh timestamped name (a brand-new run).
+
+    TIMEOUT: pass timeout_hours to set THIS job's wall-clock ceiling (Batch SIGKILLs the
+    attempt at the limit). It overrides the Job Definition's default per job with NO
+    redeploy — size it to the run (e.g. ~19 h for a single-L40S 20000-step full-VLM
+    fine-tune; a short probe needs ~2 h). Omit it → the deployed JobDefinition default.
+
+    SPOT: spot=True (default) runs on the cheap Spot queue (reclaim restarts the attempt,
+    resuming from the EFS checkpoint); spot=False routes to the On-Demand queue for a long
+    sanctioned run that should not eat Spot-reclaim restarts. Both queues are deployed once
+    (idle CEs scale to 0 vCPU, so the waiting queue costs nothing) — switching is per-job,
+    no redeploy.
 
     SAFETY: dry_run defaults to True — it returns the resolved plan + cost estimate WITHOUT
     launching (and without needing creds for the plan). Call again with dry_run=False to
@@ -149,6 +161,8 @@ def submit_finetune(
     }
     if job_name is not None:
         event["job_name"] = job_name
+    if timeout_hours is not None:
+        event["timeout_hours"] = timeout_hours
     if steps is not None:
         event["steps"] = steps
     if max_iterations is not None:
@@ -249,11 +263,19 @@ def list_my_jobs(intent: str = "il", region: str | None = None, max_results: int
         outs = aws.stack_outputs(sess, stack)
     except RuntimeError as e:
         return {"error": str(e)}
-    queue = outs.get("JobQueueArn")
-    if not queue:
+    # IL Pattern A owns a Spot + On-Demand queue pair; a job lands on whichever the
+    # submit picked, so list across BOTH. RL/GR00T are single-queue. De-dupe in case an
+    # older stack lacks the OD output (it falls back to the same Spot ARN).
+    queues = [outs.get("JobQueueArn")]
+    if intent not in ("rl", "gr00t", "groot") and outs.get("JobQueueArnOnDemand"):
+        queues.append(outs.get("JobQueueArnOnDemand"))
+    queues = [q for i, q in enumerate(queues) if q and q not in queues[:i]]
+    if not queues:
         return {"error": f"{stack} has no JobQueueArn output — is it deployed?"}
-    jobs = aws.list_jobs(sess, queue, max_results=max_results)
-    return {"queue": queue, "count": len(jobs), "jobs": [
+    jobs = [j for q in queues for j in aws.list_jobs(sess, q, max_results=max_results)]
+    jobs.sort(key=lambda j: j.get("createdAt", 0), reverse=True)
+    jobs = jobs[:max_results]
+    return {"queues": queues, "count": len(jobs), "jobs": [
         {"job_id": j.get("jobId"), "job_name": j.get("jobName"),
          "status": j.get("status"), "created_at": j.get("createdAt"),
          "status_reason": j.get("statusReason")}

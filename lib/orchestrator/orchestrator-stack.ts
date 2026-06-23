@@ -39,6 +39,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as path from 'path';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import { Construct } from 'constructs';
@@ -47,7 +48,6 @@ import { PatternAStack } from '../il/pattern-a-stack';
 import { PatternBStack } from '../il/pattern-b-stack';
 import { GrootPatternAStack } from '../il/gr00t-pattern-a-stack';
 import { RlPatternAStack } from '../rl/pattern-a-stack';
-import { TrainingNotifications } from '../shared/notifications';
 
 export interface OrchestratorStackProps extends cdk.StackProps {
   /** Shared base (buckets, ECR, jobBasePolicy) — for the Lambda's S3/ECR access envelope. */
@@ -74,7 +74,6 @@ export class OrchestratorStack extends cdk.Stack {
   public readonly stateMachine: sfn.StateMachine;
   public readonly planFn: lambda.Function;
   public readonly submitFn: lambda.Function;
-  public readonly notifications?: TrainingNotifications;
 
   constructor(scope: Construct, id: string, props: OrchestratorStackProps) {
     super(scope, id, props);
@@ -115,8 +114,10 @@ export class OrchestratorStack extends cdk.Stack {
         'PAI orchestrator submit step: submit Batch (IL-A/RL-A) faithfully, hand off SageMaker (B) as launch.py',
       environment: {
         REGION: this.region,
-        // IL Pattern A (Batch) wiring — the four batch_launch.py needs.
+        // IL Pattern A (Batch) wiring — the four batch_launch.py needs, plus the On-Demand
+        // queue so the submit step can pick Spot vs On-Demand per job (no redeploy).
         IL_A_JOB_QUEUE: ilPatternA.jobQueue.jobQueueArn,
+        IL_A_JOB_QUEUE_OD: ilPatternA.jobQueueOnDemand.jobQueueArn,
         IL_A_JOB_DEFINITION: ilPatternA.jobDefinition.jobDefinitionArn,
         IL_A_CODE_S3: `s3://${base.artifactBucket.bucketName}/vla-ft-code/train.py`,
         IL_A_OUTPUT_S3: `s3://${base.artifactBucket.bucketName}/vla-ft`,
@@ -149,6 +150,7 @@ export class OrchestratorStack extends cdk.Stack {
         actions: ['batch:SubmitJob'],
         resources: [
           ilPatternA.jobQueue.jobQueueArn,
+          ilPatternA.jobQueueOnDemand.jobQueueArn,
           ilPatternA.jobDefinition.jobDefinitionArn,
           rlPatternA.jobQueue.jobQueueArn,
           rlPatternA.jobDefinition.jobDefinitionArn,
@@ -170,11 +172,16 @@ export class OrchestratorStack extends cdk.Stack {
       }),
     );
 
-    // --- Notifications topic (reused construct; opt-in email) ---
-    this.notifications = new TrainingNotifications(this, 'Notifications', {
-      namePrefix,
-      notifyEmail: props.notifyEmail,
-    });
+    // --- Notifications topic ---
+    // Reuse the platform-shared topic (owned by Base) so the orchestrator's SFN
+    // success/failure publishes reach the same subscription as the pattern-stack job
+    // alerts — and there's no second fixed-name topic to collide. If Base has no topic
+    // (notifyEmail not set), fall back to a stack-local auto-named topic so the SFN
+    // SnsPublish targets always have a topic (no subscription until an email is wired).
+    const outcomeTopic =
+      base.notificationTopic ?? new sns.Topic(this, 'OrchestratorOutcomeTopic', {
+        displayName: 'PAI Training Platform - orchestrator',
+      });
 
     // --- State machine definition ---
     const plan = new tasks.LambdaInvoke(this, 'Plan', {
@@ -203,13 +210,13 @@ export class OrchestratorStack extends cdk.Stack {
     });
 
     const notifySuccess = new tasks.SnsPublish(this, 'NotifyOutcome', {
-      topic: this.notifications.topic,
+      topic: outcomeTopic,
       subject: 'PAI orchestrator - run planned',
       message: sfn.TaskInput.fromJsonPathAt('$'),
     });
 
     const notifyFailure = new tasks.SnsPublish(this, 'NotifyFailure', {
-      topic: this.notifications.topic,
+      topic: outcomeTopic,
       subject: 'PAI orchestrator - run FAILED',
       message: sfn.TaskInput.fromJsonPathAt('$'),
     });
@@ -245,7 +252,7 @@ export class OrchestratorStack extends cdk.Stack {
       description: 'Start an execution with a vla_ft_cli-style intent JSON as input',
     });
     new cdk.CfnOutput(this, 'NotificationTopicArn', {
-      value: this.notifications.topic.topicArn,
+      value: outcomeTopic.topicArn,
       description: 'SNS topic for orchestrator-run outcome notifications',
     });
   }

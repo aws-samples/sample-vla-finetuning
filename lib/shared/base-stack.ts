@@ -22,6 +22,8 @@ import * as efs from 'aws-cdk-lib/aws-efs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
 
 export interface SharedBaseStackProps extends cdk.StackProps {
@@ -30,6 +32,14 @@ export interface SharedBaseStackProps extends cdk.StackProps {
    * platform deployments can coexist in one account/region. Default 'pai'.
    */
   readonly namePrefix?: string;
+  /**
+   * Opt-in email for training-job completion/failure alerts. The notification SNS topic
+   * is owned HERE (one per platform) because several pattern stacks publish to it; a
+   * fixed-name topic created per-stack collides (AWS::SNS::Topic AlreadyExists) the moment
+   * a second stack also gets notifyEmail. Pattern stacks import this topic and only add
+   * their own EventBridge rule. Supply via `-c notifyEmail=you@example.com`.
+   */
+  readonly notifyEmail?: string;
 }
 
 export class SharedBaseStack extends cdk.Stack {
@@ -53,6 +63,12 @@ export class SharedBaseStack extends cdk.Stack {
    * execution/job roles, then layer service-specific permissions on top.
    */
   public readonly jobBasePolicy: iam.ManagedPolicy;
+  /**
+   * Shared SNS topic for training-job terminal-state alerts. Owned here (one per platform)
+   * so multiple pattern stacks can route to it without colliding on the fixed topic name.
+   * Undefined when notifyEmail is not supplied (notifications are opt-in).
+   */
+  public readonly notificationTopic?: sns.Topic;
 
   constructor(scope: Construct, id: string, props: SharedBaseStackProps = {}) {
     super(scope, id, props);
@@ -191,6 +207,22 @@ export class SharedBaseStack extends cdk.Stack {
         }),
       ],
     });
+
+    // --- Shared notification topic (opt-in) ---
+    // One topic per platform, owned by Base. Pattern stacks import it (props.notificationTopic)
+    // and add only their own EventBridge rule — so the fixed-name topic exists exactly once
+    // and a second notifying stack never hits AWS::SNS::Topic AlreadyExists.
+    if (props.notifyEmail) {
+      this.notificationTopic = new sns.Topic(this, 'NotificationTopic', {
+        topicName: `${prefix}-training-notifications`,
+        displayName: 'PAI Training Platform',
+      });
+      this.notificationTopic.addSubscription(new subs.EmailSubscription(props.notifyEmail));
+      new cdk.CfnOutput(this, 'NotificationTopicArn', {
+        value: this.notificationTopic.topicArn,
+        description: 'Shared SNS topic for training-job terminal-state notifications',
+      });
+    }
 
     // --- Outputs (cross-stack wiring + operator convenience) ---
     new cdk.CfnOutput(this, 'VpcId', { value: this.vpc.vpcId });

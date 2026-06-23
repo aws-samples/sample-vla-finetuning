@@ -26,6 +26,12 @@
  * AzSelector (which exists for one-shot EC2/DCV launches, not a Batch CE that already
  * draws from a pool). So Pattern A does NOT wire AzSelector.
  *
+ * Spot vs On-Demand is PER JOB, not per deploy: this stack owns BOTH a Spot CE/queue
+ * (the cheap default) and an On-Demand CE/queue (reclaim-free for a long sanctioned
+ * run), sharing one Job Definition. The launcher picks the queue at SubmitJob time via
+ * the plan's `spot` flag — no redeploy to switch. Each CE scales to 0 vCPUs when idle,
+ * so the waiting queue carries no standing cost; only a running job is billed.
+ *
  * Checkpoints land on the shared EFS (`/mnt/efs/...`), so a Spot reclaim + Batch
  * retry resumes via train.py's find_latest_checkpoint(). Synthesizes with no
  * credentials. Standing cost is the base stack's NAT; the CE scales to 0 vCPUs when
@@ -56,6 +62,16 @@ export interface PatternAStackProps extends cdk.StackProps {
    */
   readonly instanceTypes?: string[];
   /**
+   * Instance fallback for the ON-DEMAND CE only. The OD queue is the sanctioned
+   * long-run path (spot=false), used for full-VLM fine-tunes whose ~40 GB replica
+   * does NOT fit a 24 GB A10G — so the OD CE must be L40S-only (no g5 fallback), or
+   * Batch's BEST_FIT_PROGRESSIVE will silently place the job on whichever GPU has
+   * capacity and the run OOMs at step 0 in the vision tower. Default ['g6e.4xlarge']
+   * (1×L40S 48 GB). The Spot CE keeps the g6e→g5 fallback (instanceTypes) for cheap /
+   * short / expert-only runs that DO fit 24 GB.
+   */
+  readonly onDemandInstanceTypes?: string[];
+  /**
    * Max vCPUs the CE may scale to. Caps concurrent jobs (16 vCPU/instance → 16 = one
    * g6e.4xlarge at a time). Default 16. Raise to run several fine-tunes in parallel.
    */
@@ -73,11 +89,16 @@ export interface PatternAStackProps extends cdk.StackProps {
   /**
    * Per-attempt wall-clock ceiling for the Job Definition. Batch SIGKILLs the job
    * (exit 137) at this limit regardless of training health. Must cover the SLOWEST
-   * sanctioned run: a single-L40S LoRA full-FT (20000 steps, batch 16) takes ~12.8 h —
-   * the original 6 h default (sized for the old ~5 h multi-GPU expert-only regime) cut
-   * a healthy run off at step 9000/20000 (job ...151444). Default 18 h gives headroom
-   * over the single-GPU ceiling; EFS-resume means an interrupted run continues, but a
-   * single attempt should still be able to finish on its own.
+   * sanctioned run: a single-L40S full-VLM LoRA fine-tune (vision unfrozen, 20000 steps,
+   * batch 16). MEASURED, not estimated: job ...151444 attempt ...b62f0794 reached only
+   * step 19000/20000 at the 18 h (64800 s) ceiling before the timeout SIGKILL — i.e.
+   * ~3.36 s/step on a single L40S (≫ the 1.0 s/step multi-GPU expert-only anchor in
+   * vla_ft_decide), so a clean 20000-step run needs ~19 h + bootstrap (base-weight
+   * download, dataset sync) + the final ~9 GB S3 model upload. The earlier "~12.8 h"
+   * sizing was wrong for this regime — that is why healthy runs kept dying one step
+   * short. Default 28 h covers the measured ~19 h with generous headroom. EFS-resume
+   * (same job_name) still continues an interrupted run, but a single uninterrupted
+   * attempt must now be able to finish on its own.
    */
   readonly attemptTimeout?: cdk.Duration;
 }
@@ -88,8 +109,15 @@ const JOB_VCPUS = 16;
 const JOB_MEMORY_GIB = 48;
 
 export class PatternAStack extends cdk.Stack {
+  /** Spot Compute Environment (the cheap default tier). */
   public readonly computeEnvironment: batch.ManagedEc2EcsComputeEnvironment;
+  /** On-Demand Compute Environment (reclaim-free tier for long sanctioned runs). */
+  public readonly computeEnvironmentOnDemand: batch.ManagedEc2EcsComputeEnvironment;
+  /** Spot Job Queue — the default (spot=true at submit). `JobQueueArn` output. */
   public readonly jobQueue: batch.JobQueue;
+  /** On-Demand Job Queue — selected per-job (spot=false). `JobQueueArnOnDemand` output. */
+  public readonly jobQueueOnDemand: batch.JobQueue;
+  /** Shared Job Definition — both queues draw from it (only the CE capacity type differs). */
   public readonly jobDefinition: batch.EcsJobDefinition;
   /** The role the container assumes — its AWS creds for S3 dataset/model I/O. */
   public readonly jobRole: iam.Role;
@@ -101,6 +129,9 @@ export class PatternAStack extends cdk.Stack {
     const { base } = props;
     const namePrefix = props.namePrefix ?? 'pai';
     const instanceTypeStrings = props.instanceTypes ?? ['g6e.4xlarge', 'g5.4xlarge'];
+    // On-Demand = sanctioned long-run / full-VLM path → L40S-only (no 24 GB g5 fallback,
+    // which OOMs a ~40 GB full-VLM replica at step 0). Spot keeps the g6e→g5 fallback.
+    const onDemandInstanceTypeStrings = props.onDemandInstanceTypes ?? ['g6e.4xlarge'];
 
     // --- Security group: egress-all (ECR/S3/HF over NAT); EFS ingress added below. ---
     const batchSg = new ec2.SecurityGroup(this, 'BatchSg', {
@@ -180,21 +211,44 @@ export class PatternAStack extends cdk.Stack {
       ],
     });
 
-    // --- Compute Environment: managed EC2, Spot, single-GPU g6e→g5 fallback. ---
-    this.computeEnvironment = new batch.ManagedEc2EcsComputeEnvironment(this, 'GpuComputeEnv', {
+    // --- Dual Compute Environment + Job Queue: Spot (default) AND On-Demand, both live. ---
+    // Spot vs On-Demand is a Compute-Environment property, so it can't be flipped per job
+    // on one CE. The standard answer is to deploy BOTH and select the queue at SubmitJob
+    // time. Each CE scales to 0 vCPUs when idle (no instance runs until a job lands), so the
+    // waiting queue costs nothing — making per-job switching free of any standing cost and,
+    // crucially, requiring NO redeploy to move a job between Spot and On-Demand.
+    //
+    //   - Spot CE → allocationStrategy SPOT_PRICE_CAPACITY_OPTIMIZED (the cheap default;
+    //     a reclaim RETRYs and train.py resumes from the EFS checkpoint).
+    //   - On-Demand CE → BEST_FIT_PROGRESSIVE (reclaim-free, for a long sanctioned run that
+    //     should not eat Spot-reclaim restarts — the same need grootUseSpot:false serves).
+    const ceCommon = {
       vpc: base.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [batchSg],
       instanceTypes: instanceTypeStrings.map((t) => new ec2.InstanceType(t)),
       useOptimalInstanceClasses: false, // we name exact GPU types; don't add C/M/R families
-      spot: true, // → allocationStrategy defaults to SPOT_PRICE_CAPACITY_OPTIMIZED
       maxvCpus: props.maxvCpus ?? 16,
       instanceRole,
       launchTemplate,
+    };
+    this.computeEnvironment = new batch.ManagedEc2EcsComputeEnvironment(this, 'GpuComputeEnv', {
+      ...ceCommon,
+      spot: true, // SPOT_PRICE_CAPACITY_OPTIMIZED
+    });
+    this.computeEnvironmentOnDemand = new batch.ManagedEc2EcsComputeEnvironment(this, 'GpuComputeEnvOnDemand', {
+      ...ceCommon,
+      // L40S-only override: a full-VLM run routed here (spot=false) must not land on a
+      // 24 GB g5 — BEST_FIT_PROGRESSIVE would otherwise pick whatever has capacity.
+      instanceTypes: onDemandInstanceTypeStrings.map((t) => new ec2.InstanceType(t)),
+      spot: false, // BEST_FIT_PROGRESSIVE (On-Demand)
     });
 
     this.jobQueue = new batch.JobQueue(this, 'GpuJobQueue', {
       computeEnvironments: [{ computeEnvironment: this.computeEnvironment, order: 1 }],
+    });
+    this.jobQueueOnDemand = new batch.JobQueue(this, 'GpuJobQueueOnDemand', {
+      computeEnvironments: [{ computeEnvironment: this.computeEnvironmentOnDemand, order: 1 }],
     });
 
     // --- Job Definition: the verified vla-ft image; command = the Batch bootstrap. ---
@@ -235,31 +289,39 @@ export class PatternAStack extends cdk.Stack {
 
     this.jobDefinition = new batch.EcsJobDefinition(this, 'VlaFtJobDef', {
       container,
-      // Spot reclaim → one retry; train.py resumes from the EFS checkpoint.
+      // Spot reclaim → retries; train.py resumes from the EFS checkpoint (same job_name).
       retryAttempts: 2,
-      // Sized for the slowest sanctioned run (single-L40S LoRA full-FT ~12.8 h), not
-      // the old ~5 h multi-GPU expert-only regime. See attemptTimeout prop.
-      timeout: props.attemptTimeout ?? cdk.Duration.hours(18),
+      // Sized for the MEASURED slowest sanctioned run: single-L40S full-VLM LoRA
+      // (~3.36 s/step × 20000 ≈ 19 h + bootstrap + ~9 GB upload). The old 18 h ceiling
+      // SIGKILLed a healthy run at step 19000/20000 (job ...151444 / b62f0794), losing
+      // the S3 upload (the bootstrap only uploads on a clean exit). 28 h gives headroom.
+      // See attemptTimeout prop.
+      timeout: props.attemptTimeout ?? cdk.Duration.hours(28),
     });
 
     // --- Job-completion notifications (opt-in) — Batch job-state-change rule. ---
-    if (props.notifyEmail) {
+    // The topic is owned by Base (one per platform); we only add this stack's rule, so
+    // multiple notifying stacks no longer collide on the fixed topic name.
+    if (base.notificationTopic) {
       this.notifications = new TrainingNotifications(this, 'Notifications', {
-        namePrefix,
-        notifyEmail: props.notifyEmail,
+        topic: base.notificationTopic,
       });
-      this.notifications.addBatchJobRule(this.jobQueue.jobQueueArn, props.notifyJobNamePrefix ?? 'vla-ft-');
-
-      new cdk.CfnOutput(this, 'NotificationTopicArn', {
-        value: this.notifications.topic.topicArn,
-        description: 'SNS topic for Batch job terminal-state notifications',
-      });
+      // Cover BOTH queues — a vla-ft- job may land on either depending on the per-job
+      // spot/on-demand selection. The name-prefix filter is the same on both.
+      this.notifications.addBatchJobRule(
+        [this.jobQueue.jobQueueArn, this.jobQueueOnDemand.jobQueueArn],
+        props.notifyJobNamePrefix ?? 'vla-ft-',
+      );
     }
 
     // --- Outputs: everything batch_launch.py needs. ---
     new cdk.CfnOutput(this, 'JobQueueArn', {
       value: this.jobQueue.jobQueueArn,
-      description: 'Pass to batch_launch.py --job-queue',
+      description: 'Spot queue (the default, spot=true). Pass to batch_launch.py --job-queue',
+    });
+    new cdk.CfnOutput(this, 'JobQueueArnOnDemand', {
+      value: this.jobQueueOnDemand.jobQueueArn,
+      description: 'On-Demand queue (spot=false, reclaim-free for long runs). Selected per-job.',
     });
     new cdk.CfnOutput(this, 'JobDefinitionArn', {
       value: this.jobDefinition.jobDefinitionArn,
