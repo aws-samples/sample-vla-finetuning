@@ -33,6 +33,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sagemaker from 'aws-cdk-lib/aws-sagemaker';
 import { Construct } from 'constructs';
 import { SharedBaseStack } from './base-stack';
+import { FsxLustreFileSystem } from './fsx-lustre';
 
 export interface HyperPodInstanceGroup {
   /** Instance-group name (e.g. 'worker', 'controller'). */
@@ -61,6 +62,19 @@ export interface HyperPodClusterProps {
   readonly lifecycleS3Uri: string;
   /** Entrypoint script filename under lifecycleS3Uri. Default 'on_create.sh'. */
   readonly lifecycleOnCreate?: string;
+  /**
+   * Attach an FSx for Lustre + S3 DRA hot tier the cluster nodes mount (the multi-node
+   * data plane — datasets + DCP checkpoints hydrate from S3, shared across all ranks over
+   * EFA). When set, an FsxLustreFileSystem is created in the platform VPC and linked to this
+   * bucket; the cluster SG is allowed to reach the FSx SG. Omit (default) for a cluster
+   * with no shared FS (e.g. a synth check, or a job that stages to local NVMe). The FSx FS
+   * bills continuously while it exists — only set this for a genuinely gated multi-node deploy.
+   */
+  readonly fsxDataRepositoryBucket?: cdk.aws_s3.IBucket;
+  /** S3 prefix under fsxDataRepositoryBucket the DRA links. Default '' (whole bucket). */
+  readonly fsxDataRepositoryPrefix?: string;
+  /** FSx Lustre capacity in GiB (PERSISTENT_2: 1200/2400/multiples of 2400). Default 9600. */
+  readonly fsxStorageCapacityGiB?: number;
 }
 
 export class HyperPodCluster extends Construct {
@@ -68,6 +82,8 @@ export class HyperPodCluster extends Construct {
   /** Cluster instance role (the nodes' identity: S3/ECR + HyperPod managed policy). */
   public readonly clusterRole: iam.Role;
   public readonly securityGroup: ec2.SecurityGroup;
+  /** The attached FSx Lustre hot tier, when fsxDataRepositoryBucket was supplied. */
+  public readonly fsx?: FsxLustreFileSystem;
 
   constructor(scope: Construct, id: string, props: HyperPodClusterProps) {
     super(scope, id);
@@ -129,6 +145,41 @@ export class HyperPodCluster extends Construct {
       // Auto-replace a failed node (resilience is HyperPod's whole point vs Batch/SM).
       nodeRecovery: 'Automatic',
     });
+
+    // --- Optional FSx Lustre hot tier (the multi-node data plane, Phase 2 construct) ---
+    // When a data-repository bucket is supplied, create an FSx Lustre + S3 DRA the cluster
+    // nodes mount (shared dataset + DCP checkpoint tier, hydrated from S3 over EFA). The
+    // cluster SG is allowed into the FSx SG so nodes can reach the Lustre client ports.
+    if (props.fsxDataRepositoryBucket) {
+      this.fsx = new FsxLustreFileSystem(this, 'Fsx', {
+        vpc: base.vpc,
+        dataRepositoryBucket: props.fsxDataRepositoryBucket,
+        dataRepositoryPrefix: props.fsxDataRepositoryPrefix,
+        storageCapacityGiB: props.fsxStorageCapacityGiB,
+        // Pin FSx to the same private subnet the cluster lands in (Lustre is single-AZ;
+        // co-locating with the nodes avoids cross-AZ data-transfer cost + latency).
+        vpcSubnet: base.vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }).subnets[0],
+      });
+      // Let the cluster nodes reach the FSx filesystem (Lustre client ports live in the
+      // FSx SG's self-referencing all-traffic rule; add the cluster SG as an allowed source).
+      this.fsx.securityGroup.connections.allowFrom(
+        this.securityGroup,
+        ec2.Port.allTraffic(),
+        'HyperPod cluster nodes mount the FSx Lustre hot tier',
+      );
+      new cdk.CfnOutput(this, 'FsxFileSystemId', {
+        value: this.fsx.fileSystem.fileSystemId,
+        description: 'FSx Lustre filesystem id the cluster mounts (multi-node data plane)',
+      });
+      new cdk.CfnOutput(this, 'FsxMountName', {
+        value: this.fsx.fileSystem.mountName,
+        description: 'FSx Lustre mount name (lifecycle on_create.sh mounts this)',
+      });
+      new cdk.CfnOutput(this, 'FsxDataRepositoryPath', {
+        value: this.fsx.dataRepositoryPath,
+        description: 'S3 path the DRA links (bidirectional NEW/CHANGED/DELETED sync)',
+      });
+    }
 
     new cdk.CfnOutput(this, 'ClusterName', {
       value: props.clusterName,

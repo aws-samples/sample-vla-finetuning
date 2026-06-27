@@ -108,6 +108,14 @@ POLICY_MAP = {
     "xvla": "xvla",
 }
 
+# Policies whose lerobot config accepts --policy.dtype / --policy.gradient_checkpointing.
+# The pi-family (PI0Config / PI0FASTConfig) defines these fields; SmolVLAConfig and the
+# classic policies (act/diffusion/...) do NOT, and draccus raises a DecodingError if the
+# flags are passed ("The fields `dtype`, `gradient_checkpointing` are not valid for
+# SmolVLAConfig"). smolvla_base is already bf16 + 0.45B, so gradient checkpointing is
+# unnecessary and dropping the flags is safe. Gate emission on membership here.
+PI_FAMILY_POLICIES = {"pi0", "pi05", "pi0_fast"}
+
 # Hyperparameters we consume directly (not forwarded as raw draccus flags).
 # Everything else becomes a --key=value passthrough so any lerobot-train flag works.
 CONSUMED_KEYS = {
@@ -296,6 +304,31 @@ def resolve_num_gpus(hp):
         return 1
 
 
+def resolve_distributed():
+    """Multi-node topology from the environment (Pattern C — HyperPod multi-node FSDP2).
+
+    The HyperPod-Slurm launcher (hyperpod_fsdp_launch.sh) sets NNODES / NODE_RANK /
+    MASTER_ADDR / MASTER_PORT from Slurm. SageMaker multi-node sets its own (the launch.py
+    instance_count>1 path) — read those too as a fallback. Returns a dict
+    {nnodes, node_rank, main_ip, main_port} when this is a genuine >1-node run, else None
+    (the single-node / single-node-multi-GPU path is unchanged → verified lock intact)."""
+    def _int(env, default=None):
+        try:
+            return int(os.environ[env])
+        except (KeyError, TypeError, ValueError):
+            return default
+
+    nnodes = _int("NNODES") or _int("SM_HOST_COUNT")
+    if not nnodes or nnodes <= 1:
+        return None
+    node_rank = _int("NODE_RANK", 0)
+    main_ip = os.environ.get("MASTER_ADDR") or os.environ.get("SM_MASTER_ADDR")
+    main_port = _int("MASTER_PORT", 29500)
+    if not main_ip:
+        return None  # no rendezvous endpoint → can't form the group; fall back to single-node
+    return {"nnodes": nnodes, "node_rank": node_rank, "main_ip": main_ip, "main_port": main_port}
+
+
 def build_command(hp):
     """Translate consumed hyperparameters + passthroughs into a lerobot-train command.
 
@@ -322,7 +355,33 @@ def build_command(hp):
     output_dir = os.path.join(SM_CHECKPOINT_DIR, "run")
 
     num_gpus = resolve_num_gpus(hp)
-    if num_gpus > 1:
+    dist = resolve_distributed()
+    if dist:
+        # Pattern C — multi-node FSDP2 via accelerate (NO lerobot fork: accelerate natively
+        # does multi-node + FSDP, and lerobot auto-detects the accelerate context exactly as
+        # it does for single-node --multi_gpu). FSDP (not DDP) is what makes a model whose
+        # replica exceeds one GPU trainable: it SHARDS params+optimizer+grads across all
+        # ranks (vla_ft_decide routes >48 GB replicas here). The EFA fabric (Phase 1 :efa
+        # image) carries the inter-node NCCL collectives; DCP (dcp_checkpoint.py) handles the
+        # sharded checkpoint. Effective batch = per-device batch × num_gpus × nnodes; the
+        # caller holds it constant to preserve the verified optimizer trajectory.
+        total_procs = num_gpus * dist["nnodes"]
+        launcher = [
+            "accelerate", "launch",
+            "--use_fsdp",
+            f"--num_processes={total_procs}",
+            f"--num_machines={dist['nnodes']}",
+            f"--machine_rank={dist['node_rank']}",
+            f"--main_process_ip={dist['main_ip']}",
+            f"--main_process_port={dist['main_port']}",
+            "--mixed_precision=bf16",
+            # FULL_SHARD = ZeRO-3 (params+grads+optimizer sharded) — the setting that fits a
+            # >1-GPU replica; matches the source FSDP2 shard_degree=-1 (full sharding).
+            "--fsdp_sharding_strategy=FULL_SHARD",
+            "--fsdp_state_dict_type=SHARDED_STATE_DICT",
+            "-m", "lerobot.scripts.lerobot_train",
+        ]
+    elif num_gpus > 1:
         # accelerate launch --multi_gpu --num_processes=N --mixed_precision=bf16 \
         #     -m lerobot.scripts.lerobot_train ...
         launcher = [
@@ -351,7 +410,12 @@ def build_command(hp):
     # Consumed scalar knobs (only emit when provided).
     if "pretrained_path" in hp:
         cmd.append(f"--policy.pretrained_path={hp['pretrained_path']}")
-    if "dtype" in hp:
+    # --policy.dtype / --policy.gradient_checkpointing exist only on the pi-family
+    # config (see PI_FAMILY_POLICIES). Emitting them for smolvla / act / etc. trips a
+    # draccus DecodingError, so skip them for any non-pi policy. The flags are harmless
+    # to drop for smolvla_base (already bf16; checkpointing not needed at 0.45B).
+    pi_family = policy_type in PI_FAMILY_POLICIES
+    if "dtype" in hp and pi_family:
         cmd.append(f"--policy.dtype={hp['dtype']}")
     if "steps" in hp:
         cmd.append(f"--steps={hp['steps']}")
@@ -359,7 +423,7 @@ def build_command(hp):
         cmd.append(f"--batch_size={hp['batch_size']}")
     if "save_freq" in hp:
         cmd.append(f"--save_freq={hp['save_freq']}")
-    if str(hp.get("gradient_checkpointing", "")).lower() == "true":
+    if str(hp.get("gradient_checkpointing", "")).lower() == "true" and pi_family:
         cmd.append("--policy.gradient_checkpointing=true")
     if "freeze_vision_encoder" in hp:
         cmd.append(f"--policy.freeze_vision_encoder={hp['freeze_vision_encoder']}")
@@ -420,6 +484,112 @@ def build_command(hp):
     return cmd
 
 
+# ── GPU telemetry (the DCGM-pattern signal, on the existing CloudWatch channel) ──────
+# Inlined (not a sibling module) because train.py is shipped self-contained: Pattern A's
+# bootstrap downloads ONLY this one file from S3, and Pattern B ships src/ as source_dir —
+# a sibling import would fail at runtime. Stdlib + nvidia-smi only.
+
+# nvidia-smi fields pulled per sample (bare numbers via nounits), in this order.
+_GPU_QUERY_FIELDS = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit"
+GPU_TELEMETRY_INTERVAL_S = 30
+
+
+def _gpu_sample_line():
+    """One nvidia-smi sample → a parseable '[gpu-telemetry] ...' line, or None if no GPU.
+
+    Aggregates across visible GPUs: util mean/min, summed mem used/total + %, max temp,
+    summed power draw/limit. Never raises (telemetry must not disturb training)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={_GPU_QUERY_FIELDS}",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    rows = [[c.strip() for c in ln.split(",")] for ln in out.stdout.splitlines() if ln.strip()]
+    if not rows:
+        return None
+
+    utils, mem_used, mem_total, temps, p_draw, p_limit = [], 0.0, 0.0, [], 0.0, 0.0
+    for r in rows:
+        def _num(idx):
+            try:
+                return float(r[idx])
+            except (IndexError, ValueError):
+                return None
+        u = _num(0)
+        if u is not None:
+            utils.append(u)
+        mu, mt, t = _num(1), _num(2), _num(3)
+        if mu is not None:
+            mem_used += mu
+        if mt is not None:
+            mem_total += mt
+        if t is not None:
+            temps.append(t)
+        pd, pl = _num(4), _num(5)
+        if pd is not None:
+            p_draw += pd
+        if pl is not None:
+            p_limit += pl
+    if not utils:
+        return None
+
+    mem_pct = (mem_used / mem_total * 100.0) if mem_total else 0.0
+    parts = ["[gpu-telemetry]", f"gpus={len(rows)}",
+             f"util_mean={sum(utils) / len(utils):.0f}%", f"util_min={min(utils):.0f}%",
+             f"mem_used={mem_used:.0f}MiB", f"mem_total={mem_total:.0f}MiB",
+             f"mem_pct={mem_pct:.0f}%"]
+    if temps:
+        parts.append(f"temp_max={max(temps):.0f}C")
+    if p_limit:
+        parts.append(f"power={p_draw:.0f}/{p_limit:.0f}W")
+    return " ".join(parts)
+
+
+def start_gpu_telemetry():
+    """Start a daemon thread printing a GPU-saturation line every ~30 s. Default-on;
+    opt-out with VLA_FT_GPU_TELEMETRY=0. No-op (no thread) on a CPU box / when nvidia-smi
+    is absent. A priming sample runs inline so the first reading lands immediately and an
+    absent GPU short-circuits without spawning a thread."""
+    if os.environ.get("VLA_FT_GPU_TELEMETRY", "1").strip().lower() in ("0", "false", "no"):
+        return
+    try:
+        interval = max(5, int(os.environ.get("VLA_FT_GPU_TELEMETRY_INTERVAL_S",
+                                             str(GPU_TELEMETRY_INTERVAL_S))))
+    except (TypeError, ValueError):
+        interval = GPU_TELEMETRY_INTERVAL_S
+
+    try:
+        first = _gpu_sample_line()
+    except Exception:  # noqa: BLE001 — telemetry must never raise into training
+        first = None
+    if first is None:
+        return  # no GPU / nvidia-smi unavailable → quiet no-op
+    print(first, flush=True)
+    print(f"[gpu-telemetry] GPU saturation sampling ON (every {interval}s → CloudWatch).",
+          flush=True)
+
+    import threading
+    import time
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                line = _gpu_sample_line()
+            except Exception:  # noqa: BLE001
+                line = None
+            if line is None:
+                return
+            print(line, flush=True)
+
+    threading.Thread(target=_loop, name="gpu-telemetry", daemon=True).start()
+
+
 def main():
     print("=" * 60, flush=True)
     print("VLA-FT — SageMaker Training Job (LeRobot / draccus)", flush=True)
@@ -438,6 +608,13 @@ def main():
     os.environ.setdefault("HF_HUB_OFFLINE", "0")  # base weights may pull; dataset is local
     # expandable_segments reduces allocator fragmentation (PyTorch OOM hint).
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    # GPU telemetry → CloudWatch (the DCGM-pattern signal on this platform's existing log
+    # channel). A daemon thread prints a parseable [gpu-telemetry] line every ~30 s so the
+    # MCP liveness check can see GPU util/mem, not just the step/loss line — closing the
+    # cold-load-warmup false positive and the idle-burn false negative. Default-on, opt-out
+    # via VLA_FT_GPU_TELEMETRY=0; best-effort (no GPU / nvidia-smi absent → quiet no-op).
+    start_gpu_telemetry()
 
     hp = load_hyperparameters()
     print(f"Hyperparameters: {json.dumps(hp, indent=2)}", flush=True)

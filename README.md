@@ -168,7 +168,7 @@ override it.
 |---------|---------|----------|-----------|--------|
 | **A** | AWS Batch + EC2 Spot (single GPU, e.g. g6e.4xlarge) | small / short jobs, single-GPU fit, cheap PoC | single-GPU ceiling — won't fit large models or multi-GPU; relies on checkpoint+retry for Spot reclaim (no managed resume) | verified end-to-end |
 | **B** | SageMaker Training Job + Managed Spot (multi-GPU, single node) | medium jobs, 8h+, needs auto-resume | SageMaker overhead vs raw Batch; still a single-node ceiling | code complete; real deploy pending (reuses the verified container) |
-| **C** | SageMaker HyperPod (multi-node, EFA + FSx) | large multi-node, days | highest setup cost — you hold a cluster; only pays off for the largest jobs | code + `cdk synth`; real deploy deferred |
+| **C** | SageMaker HyperPod Slurm (multi-node FSDP2, EFA + FSx Lustre + DCP) | large multi-node, days | highest setup cost — you hold a cluster; only pays off for the largest jobs | deploy-gated reference: synthesizes a complete cluster (`-c enableHyperPod=true [-c hyperPodFsx=true]`), 1-shot deploy-ready; a real multi-node run is deferred (cluster cost + g-series cluster quota=0) |
 
 ### How the backend is chosen
 
@@ -289,7 +289,13 @@ This README does not oversell. The same caveats are tracked in
   against real CloudFormation Outputs, but a live `--yes` submit is the remaining check.
   The cost estimate is anchored to a verified run, not a per-job profiler.
 - **Pattern B/C are not deploy-verified.** B is code-complete (reuses the verified A
-  container); C is code + `cdk synth` only — a real HyperPod multi-node deploy is deferred.
+  container). C is a deploy-gated, 1-shot-ready reference: `-c enableHyperPod=true`
+  synthesizes a complete HyperPod Slurm cluster (multi-node FSDP2 via `accelerate
+  --use_fsdp` on the unchanged train.py, EFA fabric image `build.sh --efa`, sharded
+  DCP checkpoints to an optional FSx Lustre + S3 DRA hot tier, `hyperpod_fsdp_launch.sh`).
+  A real multi-node run is deferred (standing cluster cost + g-series *cluster* quota=0).
+  The Slurm orchestrator is deliberate — matching the source's EKS+KubeRay/JobSet would
+  add a K8s operational layer (a fork, not an absorption); an EKS path is a future option.
 - **Ingest has a known gap.** raw video → action labels is exposed as a pluggable adapter
   slot but **not implemented**; HDF5 and LeRobot v3 inputs are ready, rosbag is a pattern.
 - **Pattern A overlaps existing AWS samples** (notably VAMS, which also runs Isaac Lab RL

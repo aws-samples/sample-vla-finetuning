@@ -29,6 +29,16 @@ export interface IlHyperPodStackProps extends cdk.StackProps {
    * prefixed sibling; the operator stages real scripts there before deploy.
    */
   readonly lifecycleS3Uri?: string;
+  /**
+   * Attach an FSx for Lustre + S3 DRA hot tier (the multi-node data plane, Phase 2). When
+   * true, the cluster mounts an FSx Lustre filesystem linked to the platform dataBucket —
+   * datasets + DCP checkpoints hydrate from S3, shared across all ranks over EFA. Default
+   * false (synth check / no shared FS). The FS bills continuously, so enable only for a
+   * gated multi-node deploy. Wire via `-c enableHyperPod=true -c hyperPodFsx=true`.
+   */
+  readonly attachFsx?: boolean;
+  /** FSx Lustre capacity in GiB when attachFsx (PERSISTENT_2 valid values). Default 9600. */
+  readonly fsxStorageCapacityGiB?: number;
 }
 
 export class IlHyperPodStack extends cdk.Stack {
@@ -49,6 +59,14 @@ export class IlHyperPodStack extends cdk.Stack {
       // HyperPod requires the s3://sagemaker- prefix for lifecycle scripts.
       lifecycleS3Uri:
         props.lifecycleS3Uri ?? `s3://sagemaker-${this.region}-${this.account}/${namePrefix}/il-hyperpod-lifecycle/`,
+      // Multi-node data plane: mount an FSx Lustre hot tier linked to the platform
+      // dataBucket (datasets in, DCP checkpoints out) when attachFsx.
+      ...(props.attachFsx
+        ? {
+            fsxDataRepositoryBucket: props.base.dataBucket,
+            fsxStorageCapacityGiB: props.fsxStorageCapacityGiB,
+          }
+        : {}),
     });
   }
 }

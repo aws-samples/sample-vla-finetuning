@@ -81,6 +81,27 @@ check(r.latest_step == 137 and r.total_steps == 1500, f"iter 137/1500 (got {r.la
 check(abs(r.latest_reward - 12.4) < 1e-9, f"reward 12.4 (got {r.latest_reward})")
 
 
+# ── GPU telemetry parsing (the DCGM-pattern signal on the CloudWatch channel) ─────────
+print("GPU telemetry parsing:")
+GPU_LINE = ("[gpu-telemetry] gpus=4 util_mean=86% util_min=83% mem_used=152010MiB "
+            "mem_total=184272MiB mem_pct=82% temp_max=67C power=1180/1200W throttle=0")
+pg = st.parse_progress(GPU_LINE, "lerobot")
+check(pg.saw_gpu_line, "[gpu-telemetry] line detected")
+check(pg.gpu_util_mean == 86 and pg.gpu_mem_pct == 82, f"util_mean=86 mem_pct=82 (got {pg.gpu_util_mean}/{pg.gpu_mem_pct})")
+check(pg.gpu_temp_max == 67 and pg.gpu_throttle == 0, f"temp_max=67 throttle=0 (got {pg.gpu_temp_max}/{pg.gpu_throttle})")
+# newest telemetry sample wins
+two_gpu = GPU_LINE + "\n" + GPU_LINE.replace("util_mean=86%", "util_mean=3%")
+check(st.parse_progress(two_gpu, "lerobot").gpu_util_mean == 3, "newest GPU sample wins")
+# engine-agnostic: parsed regardless of engine; short line (no power/throttle) still parses
+short = "[gpu-telemetry] gpus=1 util_mean=99% util_min=99% mem_used=40000MiB mem_total=48000MiB mem_pct=83%"
+ps = st.parse_progress(short, "rl")
+check(ps.saw_gpu_line and ps.gpu_util_mean == 99 and ps.gpu_throttle is None,
+      "short telemetry line (no power/throttle) parses; throttle None")
+# absent telemetry → all None, saw_gpu_line False
+check(not st.parse_progress("step:200 loss:0.5", "lerobot").saw_gpu_line,
+      "no telemetry line → saw_gpu_line False")
+
+
 # ── status verdict logic (the RUNNING != learning gate) ──────────────────────────────
 print("status verdict:")
 v_run_learn = st.build_verdict(
@@ -110,6 +131,71 @@ check(v_pend.liveness_ok and not v_pend.learning, "RUNNABLE -> ok-but-waiting, n
 v_ckpt = st.build_verdict(job_name="j", job_id="i", batch_status="RUNNING", elapsed_s=500,
                           progress=st.Progress(engine="lerobot"), has_checkpoint=True)
 check(v_ckpt.learning, "RUNNING + checkpoint present -> learning")
+
+
+# ── GPU-aware verdict (Phase 0: the DCGM signal refines RUNNING != learning) ──────────
+print("GPU-aware verdict:")
+# (1) Cold-load false-POSITIVE suppression: RUNNING, NO step line, but GPU busy (90%) =
+#     warming up (loading a 7B+ base), NOT a stall → liveness_ok True.
+v_warm = st.build_verdict(
+    job_name="vla-ft-pi05-x", job_id="i", batch_status="RUNNING", elapsed_s=120,
+    progress=st.parse_progress(
+        "Loading model from: lerobot/pi05_base\n"
+        "[gpu-telemetry] gpus=1 util_mean=90% util_min=90% mem_used=20000MiB "
+        "mem_total=48000MiB mem_pct=42%", "lerobot"))
+check(v_warm.liveness_ok and not v_warm.learning,
+      "RUNNING + busy GPU + no step line -> liveness_ok (warming up, not stalled)")
+check(v_warm.gpu_idle is False and v_warm.gpu_util_mean == 90, "verdict carries gpu_util_mean=90, gpu_idle False")
+check(any("warming up" in v_warm.summary.lower() or "warming up" in n.lower()
+          for n in [v_warm.summary] + v_warm.notes), "warm-up explained")
+
+# (2) Idle-burn false-NEGATIVE catch: RUNNING, NO step line, GPU idle (1%) -> stall evidence.
+v_idle = st.build_verdict(
+    job_name="isaac-rl-x", job_id="i", batch_status="RUNNING", elapsed_s=4000,
+    progress=st.parse_progress(
+        "Isaac Sim Full Streaming App is loaded\n"
+        "[gpu-telemetry] gpus=1 util_mean=1% util_min=1% mem_used=900MiB "
+        "mem_total=48000MiB mem_pct=2%", "rl"),
+    liveness_deadline_s=1200)
+check(not v_idle.liveness_ok and v_idle.gpu_idle is True, "RUNNING + idle GPU + no step -> not ok, gpu_idle True")
+check(any("idle-burn" in n.lower() for n in v_idle.notes), "idle-burn signature flagged in notes")
+
+# (3) STALE step line + GPU now idle: a step line lingers in the tail but the LATEST
+#     telemetry says idle → override learning to NOT ok (the case a step-only check misses).
+v_stale = st.build_verdict(
+    job_name="vla-ft-pi05-x", job_id="i", batch_status="RUNNING", elapsed_s=8000,
+    progress=st.parse_progress(
+        "step:200 smpl:3K loss:0.71\n"
+        "[gpu-telemetry] gpus=1 util_mean=0% util_min=0% mem_used=800MiB "
+        "mem_total=48000MiB mem_pct=2%", "lerobot"))
+check(v_stale.learning and not v_stale.liveness_ok,
+      "stale step line + idle GPU -> learning True but liveness_ok False (idle-burn override)")
+check(any("stale" in n.lower() for n in v_stale.notes), "stale-step note present")
+
+# (4) Healthy: RUNNING + step line + GPU busy -> ok, summary carries the GPU bit.
+v_ok = st.build_verdict(
+    job_name="vla-ft-pi05-x", job_id="i", batch_status="RUNNING", elapsed_s=600,
+    progress=st.parse_progress(
+        "step:400 loss:0.37\n[gpu-telemetry] gpus=4 util_mean=88% util_min=85% "
+        "mem_used=150000MiB mem_total=184000MiB mem_pct=81% throttle=0", "lerobot"))
+check(v_ok.liveness_ok and v_ok.learning and "GPU 88%" in v_ok.summary,
+      "RUNNING + step + busy GPU -> ok; summary shows GPU 88%")
+
+# (5) Throttle flagged (independent of liveness — the job IS computing).
+v_thr = st.build_verdict(
+    job_name="vla-ft-pi05-x", job_id="i", batch_status="RUNNING", elapsed_s=600,
+    progress=st.parse_progress(
+        "step:400 loss:0.37\n[gpu-telemetry] gpus=1 util_mean=80% util_min=80% "
+        "mem_used=40000MiB mem_total=48000MiB mem_pct=83% temp_max=88C throttle=1", "lerobot"))
+check(v_thr.liveness_ok and any("throttle" in n.lower() for n in v_thr.notes),
+      "throttle active -> still ok (computing) but throttle note added")
+
+# (6) Back-compat: NO telemetry line (older image) -> gpu fields None, log-line-only logic.
+v_old = st.build_verdict(
+    job_name="vla-ft-pi05-x", job_id="i", batch_status="RUNNING", elapsed_s=600,
+    progress=st.parse_progress("step:400 loss:0.37", "lerobot"))
+check(v_old.liveness_ok and v_old.gpu_idle is None and v_old.gpu_util_mean is None,
+      "no telemetry -> verdict unchanged (gpu fields None), back-compatible")
 
 
 # ── checkpoint kind detection ────────────────────────────────────────────────────────

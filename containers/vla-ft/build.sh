@@ -24,6 +24,7 @@ REGION="${AWS_REGION:-us-west-2}"
 REPO="pai/vla-ft"    # SharedBaseStack ECR repo (namePrefix 'pai' + '/vla-ft')
 TAG="latest"
 MODE="codebuild"   # codebuild (default) | local
+ENABLE_EFA=0       # 0 = single-node image (default); 1 = EFA/NCCL fabric overlay for Pattern C
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +33,10 @@ while [ $# -gt 0 ]; do
     --tag)    TAG="$2";    shift 2;;
     --local)  MODE="local"; shift;;
     --codebuild) MODE="codebuild"; shift;;
+    # --efa builds the multi-node fabric image (EFA installer 1.47.0 + GDRCopy 2.5.1 +
+    # aws-ofi-nccl, gated by the Dockerfile's ENABLE_EFA ARG). Default tag flips to ':efa'
+    # so the verified single-node ':latest' image is never overwritten by a fabric build.
+    --efa)    ENABLE_EFA=1; [ "$TAG" = "latest" ] && TAG="efa"; shift;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -58,7 +63,8 @@ if [ "$MODE" = "local" ]; then
   aws ecr get-login-password --region "$REGION" \
     | docker login --username AWS --password-stdin "$ECR"
   # --platform linux/amd64 so the image runs on SageMaker GPU hosts even when built on arm64 (M-series).
-  docker build --platform linux/amd64 -t "$URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
+  docker build --platform linux/amd64 --build-arg ENABLE_EFA="${ENABLE_EFA}" \
+    -t "$URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
   docker push "$URI"
   echo ""
   echo "Pushed (local): ${URI}"
@@ -108,7 +114,7 @@ BUILDSPEC="{
   \"version\":\"0.2\",
   \"phases\":{
     \"pre_build\":{\"commands\":[\"aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR}\"]},
-    \"build\":{\"commands\":[\"DOCKER_BUILDKIT=1 docker build -t ${URI} .\"]},
+    \"build\":{\"commands\":[\"DOCKER_BUILDKIT=1 docker build --build-arg ENABLE_EFA=${ENABLE_EFA} -t ${URI} .\"]},
     \"post_build\":{\"commands\":[\"docker push ${URI}\"]}
   }
 }"

@@ -262,9 +262,13 @@ def decide(
         rationale = (f"per-GPU replica ~{vram:.0f} GB > {MAX_SINGLE_GPU_MEM_GB} GB "
                      f"(one L40S) → needs model sharding (FSDP) → Pattern C HyperPod")
         notes.append("A model replica larger than one GPU cannot run under accelerate "
-                     "DDP (which replicates, not shards). Pattern C is code+synth only "
-                     "(real multi-node deploy deferred) — or reduce footprint "
-                     "(expert-only / LoRA / smaller model).")
+                     "DDP (which replicates, not shards) — Pattern C shards it via FSDP2 "
+                     "(accelerate --use_fsdp FULL_SHARD across nodes). Pattern C is a "
+                     "deploy-gated reference (cdk -c enableHyperPod=true synthesizes the "
+                     "cluster; launch with hyperpod_fsdp_launch.sh), NOT auto-submittable "
+                     "from this planner — it's an operator-run sbatch on the HyperPod head, "
+                     "not a Batch/SageMaker job. Or reduce footprint (expert-only / LoRA / "
+                     "smaller model) to stay on a runnable single-node pattern.")
     elif vram <= MAX_SINGLE_GPU_MEM_GB and wall <= 4.0:
         # Fits one L40S AND short → cheapest single-GPU Spot tier.
         pattern = "A"
@@ -294,8 +298,12 @@ def decide(
                      "instance; pass --instance-type ml.g6e.48xlarge for ~½ the wall-clock.")
     else:  # C
         instance_type = "g6e.48xlarge"
-        notes.append("Pattern C (HyperPod) is code+synth only — not wired into bin/app.ts; "
-                     "this is a recommendation, not a runnable path yet.")
+        notes.append("Pattern C (HyperPod Slurm, multi-node FSDP2) is a deploy-gated "
+                     "reference: deploy the cluster with `cdk deploy "
+                     "PaiTrainingPlatform-IL-HyperPod -c enableHyperPod=true "
+                     "[-c hyperPodFsx=true]`, then launch with hyperpod_fsdp_launch.sh "
+                     "(sbatch on the head). It is NOT auto-submitted by this planner — a "
+                     "real multi-node run is operator-gated (standing cluster cost).")
 
     instance = INSTANCES.get(instance_type)
     num_gpus = instance.gpus if instance else 1
@@ -498,9 +506,10 @@ def decide_rl(
         pattern = "C"
         rationale = ("multi-node distributed PPO → Pattern C (HyperPod / Batch MNP across "
                      "nodes)")
-        notes.append("RL Pattern C (multi-node) is code+synth only — not wired into "
-                     "bin/app.ts. Single-node multi-GPU (Pattern A with --num-gpus) is the "
-                     "runnable path; use it unless the run genuinely needs >1 node.")
+        notes.append("RL Pattern C (multi-node) shares the IL HyperPod cluster construct "
+                     "(deploy-gated, -c enableHyperPod=true); the RL multi-node launch path "
+                     "is not yet wired. Single-node multi-GPU (Pattern A with --num-gpus) is "
+                     "the runnable path; use it unless the run genuinely needs >1 node.")
     elif profile.num_gpus > 1:
         pattern = "A"
         rationale = (f"{profile.num_gpus}-GPU single node → RL Pattern A (Batch MNP, "

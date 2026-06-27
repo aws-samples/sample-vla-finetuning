@@ -31,6 +31,7 @@ import { PatternAStack } from '../lib/il/pattern-a-stack';
 import { PatternBStack } from '../lib/il/pattern-b-stack';
 import { GrootPatternAStack } from '../lib/il/gr00t-pattern-a-stack';
 import { RlPatternAStack } from '../lib/rl/pattern-a-stack';
+import { IlHyperPodStack } from '../lib/il/hyperpod-stack';
 
 const app = new cdk.App();
 
@@ -51,6 +52,15 @@ const rlUseSpot = app.node.tryGetContext('rlUseSpot') !== 'false';
 // GR00T Pattern A capacity: On-Demand by default (this single long fine-tune has no
 // EFS-resume, so a Spot reclaim would restart from scratch). `-c grootUseSpot=true` opts in.
 const grootUseSpot = app.node.tryGetContext('grootUseSpot') === 'true';
+
+// Pattern C (HyperPod multi-node FSDP2) is DEPLOY-GATED: a HyperPod cluster is a standing
+// multi-GPU commitment (high hourly cost) and g-series CLUSTER quotas are 0 by default, so
+// it is NOT in the default `cdk deploy --all`. Opt in with `-c enableHyperPod=true` to
+// synth/deploy the IL multi-node reference, and add `-c hyperPodFsx=true` to attach the FSx
+// Lustre + S3 DRA hot tier (the FS bills continuously — only for a real multi-node run).
+//   cdk deploy PaiTrainingPlatform-IL-HyperPod -c enableHyperPod=true -c hyperPodFsx=true
+const enableHyperPod = app.node.tryGetContext('enableHyperPod') === 'true';
+const hyperPodFsx = app.node.tryGetContext('hyperPodFsx') === 'true';
 
 const env = {
   account: process.env.CDK_DEFAULT_ACCOUNT,
@@ -126,3 +136,21 @@ new RlPatternAStack(app, 'PaiTrainingPlatform-RL-PatternA', {
   description:
     'PAI Training Platform — RL Pattern A (AWS Batch + g6e for the Isaac Lab headless-PPO container)',
 });
+
+// IL Pattern C (SageMaker HyperPod Slurm, multi-node FSDP2): the >1-node tier. DEPLOY-GATED
+// behind `-c enableHyperPod=true` (a standing multi-GPU cost + g-series cluster quota=0), so
+// the default `cdk deploy --all` never instantiates it. When enabled it synthesizes a
+// complete, deployable cluster (Slurm orchestrator, auto node recovery) running the EFA
+// fabric image (build.sh --efa) with DCP sharded checkpoints to FSx (`-c hyperPodFsx=true`).
+// Slurm (not EKS) is deliberate: the whole platform is CDK + Slurm, so this stays an
+// absorption rather than a wholesale K8s operational-layer fork (see README "Pattern C").
+if (enableHyperPod) {
+  new IlHyperPodStack(app, 'PaiTrainingPlatform-IL-HyperPod', {
+    env,
+    namePrefix,
+    base,
+    attachFsx: hyperPodFsx,
+    description:
+      'PAI Training Platform — IL Pattern C (SageMaker HyperPod Slurm, multi-node FSDP2; deploy-gated)',
+  });
+}

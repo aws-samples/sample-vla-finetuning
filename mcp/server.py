@@ -93,6 +93,7 @@ def submit_finetune(
     num_envs: int | None = None,
     max_iterations: int | None = None,
     num_gpus: int = 1,
+    num_nodes: int = 1,
     select_best: bool = False,
     val_episodes: int | None = None,
     early_stop_patience: int | None = None,
@@ -133,6 +134,14 @@ def submit_finetune(
     (idle CEs scale to 0 vCPU, so the waiting queue costs nothing) — switching is per-job,
     no redeploy.
 
+    MULTI-NODE (Pattern C): pass num_nodes>1 to request a multi-node FSDP2 fine-tune (the
+    model sharded across nodes over EFA — for a replica too big for one GPU, or to go
+    faster). This routes to Pattern C (HyperPod Slurm), which is a DEPLOY-GATED reference,
+    NOT auto-submittable from here: submit returns status='recommend_only' with the plan +
+    the operator steps (cdk deploy -c enableHyperPod=true [-c hyperPodFsx=true], then sbatch
+    hyperpod_fsdp_launch.sh on the cluster head). num_nodes=1 (default) uses the runnable
+    single-node Pattern A/B.
+
     SAFETY: dry_run defaults to True — it returns the resolved plan + cost estimate WITHOUT
     launching (and without needing creds for the plan). Call again with dry_run=False to
     actually submit (incurs GPU cost). For GR00T UNITREE_G1, the platform auto-sets
@@ -145,6 +154,7 @@ def submit_finetune(
         "model": model,
         "task": task,
         "num_gpus": num_gpus,
+        "num_nodes": num_nodes,
         "full_vlm": full_vlm,
         "lora": lora,
         "lora_r": lora_r,
@@ -210,14 +220,22 @@ def submit_finetune(
 
 # ── 2. get_job_status ────────────────────────────────────────────────────────────────
 @mcp.tool()
-def get_job_status(job_id: str, region: str | None = None, log_lines: int = 80) -> dict:
+def get_job_status(job_id: str, region: str | None = None, log_lines: int = 120) -> dict:
     """Enriched status: 'is it REALLY training?' in one call (RUNNING != learning).
 
-    Combines Batch state + the recent CloudWatch log tail + checkpoint presence into a
-    verdict: {batch_status, elapsed_s, learning, liveness_ok, latest_step, latest_loss,
-    latest_epoch (GR00T), latest_reward (RL), last_log_ts, output_s3, summary, notes}.
+    Combines Batch state + the recent CloudWatch log tail + checkpoint presence + GPU
+    saturation into a verdict: {batch_status, elapsed_s, learning, liveness_ok, latest_step,
+    latest_loss, latest_epoch (GR00T), latest_reward (RL), last_log_ts, output_s3,
+    gpu_util_mean, gpu_mem_pct, gpu_temp_max, gpu_throttle, gpu_idle, summary, notes}.
     `liveness_ok=False` while RUNNING is the danger signal the platform kept diagnosing by
-    hand (the 5.5h idle burn)."""
+    hand (the 5.5h idle burn).
+
+    GPU saturation (the DCGM-pattern signal, from train.py's [gpu-telemetry] log line)
+    refines the verdict in BOTH directions when present: RUNNING + busy GPU + no step line
+    yet = warming up (cold load), NOT a stall; RUNNING + idle GPU = idle-burn even if a
+    stale step line lingers in the tail. gpu_* fields are None for jobs whose image predates
+    GPU telemetry (the verdict then degrades to the log-line-only logic — back-compatible).
+    The default log_lines=120 ensures a 30 s-cadence telemetry line is in the tail."""
     sess = aws.session(region)
     job = aws.describe_job(sess, job_id)
     if not job:

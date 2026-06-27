@@ -60,6 +60,43 @@ describe('IlHyperPodStack', () => {
   test('node recovery is Automatic (HyperPod resilience)', () => {
     t.hasResourceProperties('AWS::SageMaker::Cluster', { NodeRecovery: 'Automatic' });
   });
+
+  test('no FSx by default (attachFsx omitted → no continuously-billing filesystem)', () => {
+    t.resourceCountIs('AWS::FSx::FileSystem', 0);
+    t.resourceCountIs('AWS::FSx::DataRepositoryAssociation', 0);
+  });
+});
+
+describe('IlHyperPodStack with attachFsx (the multi-node data plane)', () => {
+  const app = new cdk.App();
+  const base = new SharedBaseStack(app, 'FBase', { env: ENV, namePrefix: 'pai' });
+  const stack = new IlHyperPodStack(app, 'FsxHyperPod', {
+    env: ENV,
+    namePrefix: 'pai',
+    base,
+    attachFsx: true,
+  });
+  const t = Template.fromStack(stack);
+
+  test('attaches ONE PERSISTENT_2 FSx Lustre + a bidirectional DRA linked to the dataBucket', () => {
+    t.resourceCountIs('AWS::FSx::FileSystem', 1);
+    t.hasResourceProperties('AWS::FSx::FileSystem', {
+      FileSystemType: 'LUSTRE',
+      LustreConfiguration: Match.objectLike({ DeploymentType: 'PERSISTENT_2', PerUnitStorageThroughput: 1000 }),
+    });
+    t.resourceCountIs('AWS::FSx::DataRepositoryAssociation', 1);
+    t.hasResourceProperties('AWS::FSx::DataRepositoryAssociation', {
+      S3: Match.objectLike({
+        AutoImportPolicy: { Events: ['NEW', 'CHANGED', 'DELETED'] },
+        AutoExportPolicy: { Events: ['NEW', 'CHANGED', 'DELETED'] },
+      }),
+    });
+  });
+
+  test('exposes the FSx mount outputs the lifecycle script needs', () => {
+    t.hasOutput('*', { Description: Match.stringLikeRegexp('FSx Lustre filesystem id') });
+    t.hasOutput('*', { Description: Match.stringLikeRegexp('FSx Lustre mount name') });
+  });
 });
 
 describe('RlHyperPodStack', () => {

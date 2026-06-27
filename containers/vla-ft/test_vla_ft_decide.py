@@ -578,10 +578,43 @@ def test_groot():
           "submit dispatch: GR00T want_hf always True (gated backbone)")
 
 
+def test_multinode_pattern_c():
+    """num_nodes>1 is an explicit multi-node request → Pattern C (HyperPod FSDP2), which is
+    a deploy-gated reference (NOT auto-submitted). Phase 5: the planner routes it, threads
+    num_nodes through submit, and the envelope marks it not-runnable so the orchestrator
+    Choice state returns a recommendation (the operator runs sbatch on the cluster)."""
+    print("multi-node Pattern C (Phase 5 — deploy-gated FSDP2 routing):")
+    import orchestrator_plan as op
+
+    # num_nodes>1 → backend forced to hyperpod (Pattern C) even for a small replica.
+    plan_mn = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 20000, "num_nodes": 2})
+    check(plan_mn["pattern"] == "C" and not plan_mn["runnable"],
+          "num_nodes=2 → Pattern C, NOT runnable (operator-gated sbatch, not a Batch job)")
+    check(plan_mn["submit"]["num_nodes"] == 2,
+          "num_nodes threads through the IL submit dict (the launcher reads it as --nodes)")
+    # The decision notes now describe the deploy-gated reference, not 'synth-only/not wired'.
+    notes = " ".join(plan_mn["decision"]["notes"])
+    check("enableHyperPod=true" in notes and "hyperpod_fsdp_launch.sh" in notes,
+          "Pattern C notes give the deploy-gate + launcher (accurate, not 'synth-only')")
+    check("not wired into bin/app.ts" not in notes,
+          "stale 'not wired into bin/app.ts' language is gone")
+
+    # num_nodes=1 (default) stays on the runnable single-node path (unchanged).
+    plan_sn = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 20000})
+    check(plan_sn["pattern"] == "B" and plan_sn["runnable"] and plan_sn["submit"]["num_nodes"] == 1,
+          "num_nodes default 1 → runnable single-node Pattern B (unchanged), submit num_nodes=1")
+
+    # An explicit backend override still wins over the num_nodes→hyperpod inference.
+    plan_ovr = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200,
+                        "num_nodes": 2, "backend": "batch"})
+    check(plan_ovr["pattern"] == "A",
+          "explicit --backend batch overrides the num_nodes→C inference (user wins)")
+
+
 def main():
     for t in (test_rule_table, test_overrides, test_lora, test_cost_anchor, test_budget,
               test_cli_argv, test_cli_rl_argv, test_orchestrator, test_per_job_controls,
-              test_gpu_floor_guard, test_groot):
+              test_gpu_floor_guard, test_groot, test_multinode_pattern_c):
         t()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

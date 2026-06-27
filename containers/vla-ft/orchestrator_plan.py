@@ -76,10 +76,17 @@ def _il_plan(event: dict) -> dict:
         bool(event.get("lora", False)),
     )
     profile = dec.profile_run(model, steps, ft_mode)
+    # num_nodes>1 is an explicit multi-node request → force Pattern C (HyperPod FSDP2),
+    # regardless of whether the replica would otherwise fit one GPU. The user is asking to
+    # shard across nodes (e.g. to go faster, or a model bigger than the VRAM heuristic knows).
+    num_nodes = int(event.get("num_nodes", 1) or 1)
+    backend_override = event.get("backend")
+    if num_nodes > 1 and not backend_override:
+        backend_override = "hyperpod"
     decision = dec.decide(
         profile,
         budget_usd=event.get("budget_usd"),
-        backend_override=event.get("backend"),
+        backend_override=backend_override,
         instance_override=event.get("instance_type"),
         spot=bool(event.get("spot", True)),
     )
@@ -98,6 +105,9 @@ def _il_plan(event: dict) -> dict:
         "steps": steps,
         "per_device_batch": decision.per_device_batch,
         "num_gpus": decision.num_gpus,
+        # Multi-node node count (Pattern C). 1 for single-node A/B. The HyperPod launcher
+        # (hyperpod_fsdp_launch.sh) reads this as --nodes; train.py shards FSDP2 across them.
+        "num_nodes": num_nodes,
         "instance_type": decision.instance_type,
         "sm_instance_type": decision.sm_instance_type,
         "spot": decision.spot,

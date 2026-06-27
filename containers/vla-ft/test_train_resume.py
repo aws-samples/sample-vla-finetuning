@@ -195,6 +195,60 @@ def test_path_alignment_with_stage_final():
         )
 
 
+def test_multinode_fsdp_branch():
+    print("Pattern C: multi-node env → accelerate --use_fsdp (single-node byte-identical):")
+    # Snapshot + clear the distributed/SM env so the single-node assertion is clean.
+    saved = {k: os.environ.get(k) for k in
+             ("NNODES", "NODE_RANK", "MASTER_ADDR", "MASTER_PORT", "SM_NUM_GPUS", "SM_HOST_COUNT")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        hp = {"policy": "pi05", "steps": "20000", "full_vlm": "true", "job_name": "x"}
+
+        # (1) Single-node (no NNODES): the verified path — plain `python -m lerobot...`,
+        #     NO accelerate, NO FSDP flags. resolve_distributed() is None.
+        check(train.resolve_distributed() is None, "no NNODES → resolve_distributed None")
+        single = " ".join(train.build_command(dict(hp)))
+        check("accelerate launch" not in single and "--use_fsdp" not in single,
+              "single-node command is the verified plain launcher (no accelerate/FSDP)")
+
+        # (2) Single-node multi-GPU (SM_NUM_GPUS=4, still 1 node): accelerate --multi_gpu,
+        #     NOT --use_fsdp (DDP, the existing Pattern B path — unchanged).
+        os.environ["SM_NUM_GPUS"] = "4"
+        mg = " ".join(train.build_command(dict(hp)))
+        check("--multi_gpu" in mg and "--use_fsdp" not in mg,
+              "single-node 4-GPU → accelerate --multi_gpu (DDP), not FSDP")
+        os.environ.pop("SM_NUM_GPUS", None)
+
+        # (3) Multi-node (NNODES=2, 8 GPU/node): accelerate --use_fsdp, FULL_SHARD, the
+        #     machine_rank/main_process_ip from the env, num_processes = gpus × nodes.
+        os.environ.update(NNODES="2", NODE_RANK="1", MASTER_ADDR="10.0.0.5",
+                          MASTER_PORT="29500", SM_NUM_GPUS="8")
+        d = train.resolve_distributed()
+        check(d == {"nnodes": 2, "node_rank": 1, "main_ip": "10.0.0.5", "main_port": 29500},
+              "resolve_distributed reads NNODES/NODE_RANK/MASTER_ADDR/PORT")
+        mn = " ".join(train.build_command(dict(hp)))
+        check("accelerate launch" in mn and "--use_fsdp" in mn, "multi-node → accelerate --use_fsdp")
+        check("--num_machines=2" in mn and "--machine_rank=1" in mn,
+              "num_machines + machine_rank from the env")
+        check("--num_processes=16" in mn, "num_processes = 8 gpu × 2 nodes = 16")
+        check("--main_process_ip=10.0.0.5" in mn and "--main_process_port=29500" in mn,
+              "rendezvous endpoint wired from MASTER_ADDR/PORT")
+        check("--fsdp_sharding_strategy=FULL_SHARD" in mn and "--fsdp_state_dict_type=SHARDED_STATE_DICT" in mn,
+              "FULL_SHARD (ZeRO-3) + SHARDED_STATE_DICT (DCP-shaped checkpoint)")
+
+        # (4) Multi-node env but NO MASTER_ADDR → can't rendezvous → falls back to single-node.
+        os.environ.pop("MASTER_ADDR", None)
+        check(train.resolve_distributed() is None,
+              "NNODES set but no MASTER_ADDR → None (safe single-node fallback, no half-formed group)")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main():
     for t in (
         test_case_a_checkpoint_exists_resumes,
@@ -205,6 +259,7 @@ def main():
         test_path_alignment_with_stage_final,
         test_resume_emits_config_path_file,
         test_hp_s3_roundtrip_matches_env_path,
+        test_multinode_fsdp_branch,
     ):
         t()
     print(f"\n{PASS} passed, {FAIL} failed")

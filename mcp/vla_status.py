@@ -66,6 +66,20 @@ _GROOT_EPOCH = re.compile(r"'epoch':\s*([\d.]+)")
 _RL_ITER = re.compile(r"Learning iteration\s+(\d+)/(\d+)")
 _RL_REWARD = re.compile(r"Mean reward:\s*([\-\d.]+)")
 
+# GPU telemetry line (train.py's start_gpu_telemetry, the DCGM-pattern signal on the
+# CloudWatch channel): "[gpu-telemetry] gpus=4 util_mean=86% util_min=83% mem_used=...
+# mem_total=... mem_pct=82% temp_max=67C power=1180/1200W throttle=0". Each field anchored
+# independently so a short line (power/throttle absent on some instances) still parses.
+_GPU_LINE = re.compile(r"\[gpu-telemetry\]")
+_GPU_UTIL_MEAN = re.compile(r"\butil_mean=(\d+)%")
+_GPU_MEM_PCT = re.compile(r"\bmem_pct=(\d+)%")
+_GPU_TEMP_MAX = re.compile(r"\btemp_max=(\d+)C")
+_GPU_THROTTLE = re.compile(r"\bthrottle=(\d+)")
+
+# Below this GPU utilization a RUNNING job is doing ~no compute — the idle-burn signature.
+# 5 % leaves headroom for between-step/dataloader dips while still flagging a true idle.
+GPU_IDLE_UTIL_PCT = 5
+
 
 def _expand_k(tok: str) -> int:
     """Expand a lerobot 'K'-suffixed integer token ('3K' → 3000, '200' → 200)."""
@@ -85,6 +99,33 @@ class Progress:
     latest_epoch: float | None = None     # GR00T (no integer step counter in the dict)
     latest_reward: float | None = None    # RL only
     saw_progress_line: bool = False       # a real training line (not just boot) was seen
+    # GPU telemetry (the DCGM-pattern signal — train.py's [gpu-telemetry] line). None when
+    # no telemetry line is in the tail (older image / telemetry off).
+    gpu_util_mean: int | None = None      # mean GPU utilization % across visible GPUs
+    gpu_mem_pct: int | None = None        # aggregate GPU memory used %
+    gpu_temp_max: int | None = None       # hottest GPU °C
+    gpu_throttle: int | None = None       # 1 = a non-idle clock throttle was active
+    saw_gpu_line: bool = False            # a [gpu-telemetry] line was seen
+
+
+def _parse_gpu(log_tail: str, p: Progress) -> None:
+    """Fold the LATEST [gpu-telemetry] reading into `p` (the DCGM-pattern signal). Engine-
+    agnostic: the telemetry line is identical for lerobot/gr00t/rl. Keeps the last match of
+    each field (newest sample wins). Mutates p; no-op if no telemetry line is present."""
+    if not _GPU_LINE.search(log_tail):
+        return
+    p.saw_gpu_line = True
+
+    def _last_int(rx):
+        v = None
+        for m in rx.finditer(log_tail):
+            v = m.group(1)
+        return int(v) if v is not None else None
+
+    p.gpu_util_mean = _last_int(_GPU_UTIL_MEAN)
+    p.gpu_mem_pct = _last_int(_GPU_MEM_PCT)
+    p.gpu_temp_max = _last_int(_GPU_TEMP_MAX)
+    p.gpu_throttle = _last_int(_GPU_THROTTLE)
 
 
 def parse_progress(log_tail: str, engine: str) -> Progress:
@@ -96,6 +137,8 @@ def parse_progress(log_tail: str, engine: str) -> Progress:
     p = Progress(engine=engine)
     if not log_tail:
         return p
+    # GPU telemetry is engine-agnostic — parse it for every engine before the dialect split.
+    _parse_gpu(log_tail, p)
 
     if engine == "gr00t":
         for m in _GROOT_LOSS.finditer(log_tail):
@@ -163,6 +206,13 @@ class StatusVerdict:
     latest_reward: float | None = None
     last_log_ts: int | None = None         # epoch ms of the newest log event seen
     output_s3: str | None = None
+    # GPU saturation (the DCGM-pattern signal). None when the job's image predates GPU
+    # telemetry / it's disabled — the verdict then degrades to the log-line-only logic.
+    gpu_util_mean: int | None = None
+    gpu_mem_pct: int | None = None
+    gpu_temp_max: int | None = None
+    gpu_throttle: int | None = None
+    gpu_idle: bool | None = None           # True = RUNNING but GPU ~idle (idle-burn signature)
     summary: str = ""                      # one-line human verdict
     notes: list[str] = field(default_factory=list)
 
@@ -199,6 +249,21 @@ def build_verdict(
     notes: list[str] = []
     status = (batch_status or "").upper()
 
+    # GPU saturation (the DCGM-pattern signal). gpu_idle = RUNNING + a telemetry reading
+    # below the idle floor → the job holds a GPU but does ~no compute (the idle-burn).
+    gpu_idle: bool | None = None
+    if progress.saw_gpu_line and progress.gpu_util_mean is not None:
+        gpu_idle = progress.gpu_util_mean < GPU_IDLE_UTIL_PCT
+
+    def _gpu_bit() -> str:
+        """A compact GPU suffix for the summary, when telemetry is present."""
+        if not progress.saw_gpu_line or progress.gpu_util_mean is None:
+            return ""
+        s = f"GPU {progress.gpu_util_mean}%"
+        if progress.gpu_mem_pct is not None:
+            s += f"/{progress.gpu_mem_pct}% mem"
+        return f" [{s}]"
+
     if status in _TERMINAL_OK:
         liveness_ok = True
         summary = f"{job_name}: SUCCEEDED."
@@ -218,16 +283,42 @@ def build_verdict(
                 bits.append(f"loss {progress.latest_loss:g}")
             if progress.latest_reward is not None:
                 bits.append(f"reward {progress.latest_reward:g}")
-            summary = f"{job_name}: RUNNING and learning ({', '.join(bits) or 'progress seen'})."
+            summary = (f"{job_name}: RUNNING and learning "
+                       f"({', '.join(bits) or 'progress seen'}){_gpu_bit()}.")
+            # GPU corroboration: a step line CAN be stale in the tail (logged long ago, then
+            # the GPU went idle). If the LATEST telemetry says the GPU is idle, surface it —
+            # this is the idle-burn the time-only deadline would miss while a step line lingers.
+            if gpu_idle:
+                liveness_ok = False
+                notes.append(f"⚠️ GPU util {progress.gpu_util_mean}% < {GPU_IDLE_UTIL_PCT}% "
+                             f"despite a progress line — the step line may be stale and the "
+                             f"GPU has gone idle (possible idle-burn). Re-check the newest log.")
         else:
-            summary = (f"{job_name}: RUNNING but NO learning signal in the recent log tail "
-                       f"— RUNNING != learning.")
-            notes.append("No step/loss/iteration line found yet. If the job has been RUNNING "
-                         "for more than a few minutes with no progress, it may be stalled "
-                         "(the bootstrap liveness guard will SIGTERM it at its deadline).")
-            if liveness_deadline_s and elapsed_s and elapsed_s > liveness_deadline_s:
-                notes.append(f"elapsed {elapsed_s}s exceeds the liveness deadline "
-                             f"{liveness_deadline_s}s — probable stall.")
+            # No step/loss line. GPU telemetry disambiguates the two sub-cases:
+            if gpu_idle is False:  # telemetry present AND GPU busy → warming up, not stalled
+                liveness_ok = True
+                summary = (f"{job_name}: RUNNING, GPU busy ({progress.gpu_util_mean}% util) but "
+                           f"no step line yet — warming up (model load / first step), not stalled.")
+                notes.append("GPU is saturated with no training-loop line yet — typical of a "
+                             "cold load (large base weights) or compile before step 0. Poll "
+                             "again shortly for the first step.")
+            else:
+                summary = (f"{job_name}: RUNNING but NO learning signal in the recent log tail "
+                           f"— RUNNING != learning.{_gpu_bit()}")
+                notes.append("No step/loss/iteration line found yet. If the job has been RUNNING "
+                             "for more than a few minutes with no progress, it may be stalled "
+                             "(the bootstrap liveness guard will SIGTERM it at its deadline).")
+                if gpu_idle:  # telemetry present AND GPU idle → strong stall evidence
+                    notes.append(f"GPU util {progress.gpu_util_mean}% < {GPU_IDLE_UTIL_PCT}% — "
+                                 f"the GPU is idle, not just the log quiet. This is the idle-burn "
+                                 f"signature (a GPU billed for no compute).")
+                if liveness_deadline_s and elapsed_s and elapsed_s > liveness_deadline_s:
+                    notes.append(f"elapsed {elapsed_s}s exceeds the liveness deadline "
+                                 f"{liveness_deadline_s}s — probable stall.")
+        # Throttle is independent of liveness (the job IS computing) but worth flagging.
+        if progress.gpu_throttle:
+            notes.append(f"GPU clock throttle active (temp_max="
+                         f"{progress.gpu_temp_max}C) — thermal/power limit may be slowing steps.")
     elif status in _PRE_RUN:
         liveness_ok = True
         summary = (f"{job_name}: {status} — waiting for capacity/placement (no GPU cost while "
@@ -242,5 +333,9 @@ def build_verdict(
         latest_step=progress.latest_step, total_steps=progress.total_steps,
         latest_loss=progress.latest_loss, latest_epoch=progress.latest_epoch,
         latest_reward=progress.latest_reward, last_log_ts=last_log_ts,
-        output_s3=output_s3, summary=summary, notes=notes,
+        output_s3=output_s3,
+        gpu_util_mean=progress.gpu_util_mean, gpu_mem_pct=progress.gpu_mem_pct,
+        gpu_temp_max=progress.gpu_temp_max, gpu_throttle=progress.gpu_throttle,
+        gpu_idle=gpu_idle,
+        summary=summary, notes=notes,
     )
