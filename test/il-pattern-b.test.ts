@@ -151,5 +151,29 @@ describe('PatternBStack', () => {
     test('Base exposes the notification topic ARN as an output', () => {
       nbaseT.hasOutput('NotificationTopicArn', {});
     });
+
+    // Regression guard for the silent SNS-publish failure (FailedInvocations=2/2,
+    // MessagesPublished=0): a SageMaker OOM FailureReason is a long multi-line traceback;
+    // interpolating it into the InputTransformer's JSON InputTemplate makes the template
+    // invalid, so EventBridge drops the invocation and no email is ever sent. The fix
+    // omits FailureReason (operator clicks through to the console) and attaches a DLQ so
+    // any future delivery failure is captured instead of silently lost.
+    test('the SageMaker rule does NOT interpolate FailureReason into the email body', () => {
+      const rules = nt.findResources('AWS::Events::Rule');
+      const rule = Object.values(rules)[0] as any;
+      const inputTransformer = (rule.Properties.Targets as any[])[0].InputTransformer;
+      // The InputTemplate must not reference the FailureReason path, and no path map entry
+      // may bind to it — either would re-introduce the traceback that broke the template.
+      expect(JSON.stringify(inputTransformer)).not.toMatch(/FailureReason/);
+      // It should still link to the console so the operator can read the full reason.
+      expect(inputTransformer.InputTemplate).toMatch(/console\.aws\.amazon\.com\/sagemaker/);
+    });
+
+    test('the SageMaker rule target has a dead-letter queue for failed deliveries', () => {
+      nt.resourceCountIs('AWS::SQS::Queue', 1);
+      const rules = nt.findResources('AWS::Events::Rule');
+      const rule = Object.values(rules)[0] as any;
+      expect((rule.Properties.Targets as any[])[0].DeadLetterConfig).toBeDefined();
+    });
   });
 });

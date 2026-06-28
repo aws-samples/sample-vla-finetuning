@@ -267,5 +267,14 @@ describe('PatternAStack', () => {
         }),
       });
     });
+
+    // The Batch rule shares the same diagnostic safety net as the SageMaker rule: a DLQ so
+    // a failed SNS delivery is captured, not silently dropped (see notifications.ts).
+    test('the Batch rule target has a dead-letter queue for failed deliveries', () => {
+      nt.resourceCountIs('AWS::SQS::Queue', 1);
+      const rules = nt.findResources('AWS::Events::Rule');
+      const rule = Object.values(rules)[0] as any;
+      expect((rule.Properties.Targets as any[])[0].DeadLetterConfig).toBeDefined();
+    });
   });
 });

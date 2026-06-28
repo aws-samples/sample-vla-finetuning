@@ -150,9 +150,14 @@ export class SharedBaseStack extends cdk.Stack {
       repositoryName,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       imageScanOnPush: true,
-      // KMS at-rest encryption (AWS-managed key, no standing key cost) rather than the
-      // ECR default of AES256.
-      encryption: ecr.RepositoryEncryption.KMS,
+      // AES256 (the ECR default) — NOT KMS. EncryptionConfiguration is immutable, so flipping
+      // an already-deployed AES256 repo to KMS forces a repo REPLACE; these repos are
+      // RETAIN + custom-named, so CloudFormation cannot replace them and the whole Base
+      // update rolls back (this is the §I-c#3 landmine that blocked the notification fix).
+      // The repos already hold verified images (e.g. the :efa multi-node fabric image), and
+      // KMS-with-an-AWS-managed-key buys negligible security over AES256 — not worth
+      // destroying images for. Leave at the deployed AES256 so Base updates touch only SNS.
+      encryption: ecr.RepositoryEncryption.AES_256,
       lifecycleRules: [
         {
           description: 'Expire untagged images after 14 days',

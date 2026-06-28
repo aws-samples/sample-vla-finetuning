@@ -72,6 +72,12 @@ and picks the engine + backend:
   change, and v1 ships without gating on a deploy. The Pattern B (SageMaker) path returns
   the exact verified `launch.py` command as a handoff (it is not forked in-process), and
   Pattern C (HyperPod) returns recommend-only, exactly as the orchestrator already does.
+- **MCP-only launch (no shell access)? → check `mcp_can_submit` in the dry_run plan.** It is
+  `true` only when `submit_finetune(dry_run=False)` will actually launch the job (Pattern A /
+  Batch). Pattern B is `runnable` but `mcp_can_submit:false` — it returns a `launch.py`
+  handoff an operator must run, so a consumer restricted to MCP cannot complete it. To force
+  an MCP-launchable path, pass `backend='batch'` (routes to Pattern A). The dry_run `note`
+  and `plan_text` say this explicitly so the backend can be chosen *before* submitting.
 
 ## Layout
 

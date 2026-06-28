@@ -25,7 +25,9 @@
  * day is negligible. The email subscription requires a one-time confirmation click
  * (AWS sends a "Subscription Confirmation" email on first deploy).
  */
+import * as cdk from 'aws-cdk-lib';
 import * as sns from 'aws-cdk-lib/aws-sns';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
@@ -43,9 +45,28 @@ export class TrainingNotifications extends Construct {
   /** Topic that all training-job terminal-state events publish to (owned by Base). */
   public readonly topic: sns.ITopic;
 
+  /**
+   * Dead-letter queue for events EventBridge fails to deliver to the SNS target.
+   *
+   * Why this exists: a rule whose target invocation fails (e.g. an InputTransformer
+   * that produced an unusable payload, or a transient SNS/permission error) increments
+   * the rule's FailedInvocations metric and otherwise *silently drops the event* — there
+   * is no record of which event failed or why. Attaching a DLQ captures the original
+   * event plus error metadata (ERROR_CODE / ERROR_MESSAGE / RULE_ARN / TARGET_ARN in the
+   * message attributes), so a missed alert can be diagnosed from concrete data instead of
+   * inferred from metrics. One queue per stack's construct (a construct only ever adds one
+   * of the SageMaker/Batch rules), shared by whatever rule that stack registers.
+   */
+  public readonly deadLetterQueue: sqs.Queue;
+
   constructor(scope: Construct, id: string, props: TrainingNotificationsProps) {
     super(scope, id);
     this.topic = props.topic;
+
+    this.deadLetterQueue = new sqs.Queue(this, 'NotificationDlq', {
+      retentionPeriod: cdk.Duration.days(14), // max — keep failed-delivery evidence long enough to investigate
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // diagnostic only; nothing to preserve on teardown
+    });
   }
 
   /**
@@ -69,7 +90,17 @@ export class TrainingNotifications extends Construct {
     });
 
     // Transform the raw event into a readable email. Fields absent on a given
-    // event (e.g. FailureReason on a success) render as empty strings.
+    // event (e.g. ModelArtifacts on a failure) render as empty strings.
+    //
+    // ★ FailureReason is deliberately NOT interpolated. RuleTargetInput.fromText emits an
+    // EventBridge InputTransformer whose InputTemplate is a JSON-quoted string; SageMaker's
+    // FailureReason on an OOM is a long multi-line traceback with raw newlines, double
+    // quotes and backslashes. Substituting it produces an InputTemplate that is no longer
+    // valid JSON, so EventBridge drops the target invocation entirely (FailedInvocations++,
+    // SNS NumberOfMessagesPublished stays 0 — no email at all, not even a truncated one).
+    // We surface a console deep-link instead: every interpolated field below (job name,
+    // region) is special-char-free, so the template stays valid, and the operator clicks
+    // through to the full failure reason in the SageMaker console.
     const message = events.RuleTargetInput.fromText(
       [
         `PAI Training Platform — SageMaker training job ${events.EventField.fromPath('$.detail.TrainingJobStatus')}`,
@@ -79,11 +110,13 @@ export class TrainingNotifications extends Construct {
         `Region:    ${events.EventField.fromPath('$.region')}`,
         `Time:      ${events.EventField.fromPath('$.time')}`,
         `Artifacts: ${events.EventField.fromPath('$.detail.ModelArtifacts.S3ModelArtifacts')}`,
-        `Failure:   ${events.EventField.fromPath('$.detail.FailureReason')}`,
+        '',
+        // Failure reason (full traceback) is on the console page — see "Failure reason".
+        `Details:   https://${events.EventField.fromPath('$.region')}.console.aws.amazon.com/sagemaker/home?region=${events.EventField.fromPath('$.region')}#/jobs/${events.EventField.fromPath('$.detail.TrainingJobName')}`,
       ].join('\n'),
     );
 
-    rule.addTarget(new targets.SnsTopic(this.topic, { message }));
+    rule.addTarget(new targets.SnsTopic(this.topic, { message, deadLetterQueue: this.deadLetterQueue }));
     return rule;
   }
 
@@ -116,6 +149,10 @@ export class TrainingNotifications extends Construct {
       },
     });
 
+    // Batch's statusReason is a short single-line string (e.g. "Essential container in
+    // task exited") — unlike SageMaker's FailureReason it does not carry a multi-line
+    // traceback, so interpolating it does not threaten InputTemplate validity. The DLQ is
+    // attached anyway so any future delivery failure is diagnosable, not silently dropped.
     const message = events.RuleTargetInput.fromText(
       [
         `PAI Training Platform — Batch job ${events.EventField.fromPath('$.detail.status')}`,
@@ -128,7 +165,7 @@ export class TrainingNotifications extends Construct {
       ].join('\n'),
     );
 
-    rule.addTarget(new targets.SnsTopic(this.topic, { message }));
+    rule.addTarget(new targets.SnsTopic(this.topic, { message, deadLetterQueue: this.deadLetterQueue }));
     return rule;
   }
 }

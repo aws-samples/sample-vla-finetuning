@@ -43,10 +43,18 @@ describe('SharedBaseStack', () => {
     expect(logged.length).toBe(2);
   });
 
-  test('ECR repos are KMS-encrypted', () => {
-    t.hasResourceProperties('AWS::ECR::Repository', {
-      EncryptionConfiguration: { EncryptionType: 'KMS' },
-    });
+  test('ECR repos use AES256 (the ECR default), NOT KMS — encryption config is omitted', () => {
+    // Deliberately AES256, not KMS: EncryptionConfiguration is immutable, so flipping an
+    // already-deployed AES256 repo to KMS forces a repo REPLACE. These repos are RETAIN +
+    // custom-named, so CloudFormation cannot replace them and the Base update rolls back
+    // (the landmine that blocked the SNS-notification fix; the repos hold verified images
+    // such as the :efa multi-node fabric image). AES256 is the L2 default, which CDK emits
+    // by omitting EncryptionConfiguration entirely — assert it is absent on all 3 repos.
+    const repos = t.findResources('AWS::ECR::Repository');
+    const withConfig = Object.values(repos).filter(
+      (r: any) => r.Properties?.EncryptionConfiguration !== undefined,
+    );
+    expect(withConfig).toHaveLength(0);
   });
 
   test('three ECR repos with scan-on-push (vla-ft, isaac-lab-rl, gr00t-n17)', () => {

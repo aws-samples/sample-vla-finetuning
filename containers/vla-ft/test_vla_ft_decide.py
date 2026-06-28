@@ -287,10 +287,18 @@ def test_orchestrator():
           "plan: IL pi05 20000 steps → Pattern B, runnable")
     check(plan_il["submit"]["policy"] == "pi05" and plan_il["submit"]["expert_only"],
           "plan: IL submit carries policy + expert-only default")
+    # mcp_can_submit: Pattern B is runnable (operator can launch) but NOT MCP-submittable
+    # (submit returns a launch.py handoff). The plan must say so + steer MCP-only callers.
+    check(plan_il["mcp_can_submit"] is False,
+          "plan: Pattern B → mcp_can_submit False (handoff, not auto-submit)")
+    check("MCP submit : NO" in plan_il["plan_text"] and "backend='batch'" in plan_il["plan_text"],
+          "plan: Pattern B plan_text steers MCP-only callers to backend='batch'")
 
     # plan(): IL short → Pattern A (runnable). RL → Pattern A (runnable).
-    check(op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200})["pattern"] == "A",
-          "plan: IL 200 steps → Pattern A")
+    plan_il_a = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200})
+    check(plan_il_a["pattern"] == "A", "plan: IL 200 steps → Pattern A")
+    check(plan_il_a["mcp_can_submit"] is True,
+          "plan: Pattern A → mcp_can_submit True (Batch auto-submit)")
     plan_rl = op.plan({"task": "Isaac-Velocity-Rough-H1-v0", "max_iterations": 3000})
     check(plan_rl["axis"] == "rl" and plan_rl["runnable"], "plan: RL → runnable Pattern A")
 

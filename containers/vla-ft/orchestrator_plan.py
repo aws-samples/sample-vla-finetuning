@@ -254,11 +254,25 @@ def _envelope(axis: str, profile, decision, submit: dict, plan_text: str) -> dic
                      f"image-baseline bump can OOM at step 0. Lower-footprint options: --lora "
                      f"(base frozen, optimizer state ~MB), train_expert_only, or multi-node FSDP "
                      f"(num_nodes>1, shards the optimizer state).")
+    # MCP-only launchability. `runnable` says an operator CAN run this plan; it does NOT say
+    # the MCP submit() will actually launch it. Pattern A (Batch) is submitted directly from
+    # boto3 (submitted:true). Pattern B (SageMaker) returns a launch.py handoff command
+    # (submitted:false) — by design, to keep the SDK estimator's source-tar / Managed-Spot /
+    # checkpoint reproduction on the one verified launcher rather than a boto3 fork. So a
+    # consumer constrained to "MCP only" (no shell launch.py) cannot complete a Pattern B
+    # launch. Surface that here, in the dry_run plan, so the consumer can decide the backend
+    # BEFORE submitting (previously it only surfaced as a handoff *after* an attempted submit).
+    mcp_can_submit = decision.pattern == "A"
+    if decision.pattern == "B":
+        plan_text = (f"{plan_text}\n  MCP submit : NO — Pattern B (SageMaker) requires an operator to run "
+                     f"the launch.py handoff command (submit returns submitted:false). For an MCP-only "
+                     f"workflow, pass backend='batch' to route to Pattern A (auto-submit).")
     return {
         "axis": axis,
         "pattern": decision.pattern,
         "backend": decision.backend,
         "runnable": decision.pattern in ("A", "B"),
+        "mcp_can_submit": mcp_can_submit,
         "profile": dataclasses.asdict(profile),
         "decision": dataclasses.asdict(decision),
         "submit": submit,

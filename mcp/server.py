@@ -213,6 +213,13 @@ def submit_finetune(
     plan_out = aws.plan_intent(event)
 
     if dry_run:
+        # mcp_can_submit distinguishes "an operator can run this" (runnable) from "calling
+        # submit_finetune with dry_run=False will actually launch it". Pattern B (SageMaker)
+        # is runnable but returns a launch.py handoff (submitted:false), so an MCP-only
+        # consumer must pass backend='batch' to get an auto-submitted Pattern A. Exposing it
+        # in the dry_run plan lets the consumer choose the backend before submitting, instead
+        # of discovering the handoff only after a dry_run=False attempt.
+        mcp_can_submit = plan_out.get("mcp_can_submit", plan_out["pattern"] == "A")
         return {
             "submitted": False,
             "dry_run": True,
@@ -220,10 +227,14 @@ def submit_finetune(
             "pattern": plan_out["pattern"],
             "backend": plan_out["backend"],
             "runnable": plan_out["runnable"],
+            "mcp_can_submit": mcp_can_submit,
             "plan_text": plan_out["plan_text"],
             "decision": plan_out["decision"],
             "note": "dry_run=True — nothing launched. Re-call with dry_run=False to submit "
-                    "(GPU cost). GR00T G1: pass action_horizon=50.",
+                    "(GPU cost). GR00T G1: pass action_horizon=50."
+                    + ("" if mcp_can_submit else
+                       " NOTE: mcp_can_submit=false — this backend returns a launch.py handoff, "
+                       "not an MCP-launched job. For MCP-only launch, pass backend='batch'."),
         }
 
     result = aws.submit_intent(event, region=region)
