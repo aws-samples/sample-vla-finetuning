@@ -101,15 +101,30 @@ synth could catch. All are now fixed in `lib/shared/hyperpod-cluster.ts` (+ regr
    bootstrap (TCP) works and selects NET/OFI, but the cross-node all-reduce fails "Unreachable
    remote". Emitted at L1 (`CfnSecurityGroupEgress`; the L2 form is dropped under allowAllOutbound).
 
-### Runtime gotcha (managed-Slurm + base-config) — not yet automated
+### Runtime gotcha (managed-Slurm + base-config) — automated (code), pending live re-validation
 
 After the cluster reaches InService, the awslabs base-config bundle's accounting + topology setup
 collides with HyperPod's managed slurm.conf, leaving `slurmctld` crash-looping:
 `No Assoc usage file to recover` / `GresTypes specified more than once` / `No switches configured`.
 The 2026-06-28 smoke unblocked it manually on the controller: comment `Include accounting.conf`
 and `TopologyPlugin=topology/tree` in `/opt/slurm/etc/slurm.conf`, then `systemctl restart
-slurmctld` → `sinfo` shows both workers idle. A durable fix (trim the base-config to drop
-accounting/topology, or post-process slurm.conf via a lifecycle hook) is a TODO.
+slurmctld` → `sinfo` shows both workers idle.
+
+That manual procedure is now **automated** by `fix_managed_slurm_conf.sh`, which `stage-lifecycle.sh`
+copies into the bundle and wires into `on_create.sh`'s tail (one guarded call inserted before the
+final `exit $exit_code`, so it runs *after* `lifecycle_script.py` → `start_slurm.sh` has started
+slurmctld — exactly when the collision manifests). The fix is controller-only (workers rename
+`slurmctld.service` away, which the script detects), idempotent (a `# pai-managed-slurm-reconciled`
+sentinel marker makes re-runs no-ops), and never-fatal (returns 0 in every path; `on_create.sh`
+runs under `set -e`). The **pinned base-config files stay byte-for-byte verbatim** — we add our own
+script and patch only the *staged copy* of `on_create.sh`, never the pinned source tree (same
+belt-and-suspenders pattern as the `provisioning_parameters.json` removal).
+
+> ⚠️ Validated at the staging/injection layer (bash -n, isolated patch-and-parse of the real
+> pinned `on_create.sh`), and it replicates the procedure that worked on the live 2026-06-28
+> cluster — but it has **not yet been re-validated end-to-end on a fresh $75/hr deploy** (the
+> collision only manifests on a real controller at InService). The next Pattern C deploy should
+> confirm `sinfo` shows both workers idle WITHOUT the manual step. If it does, drop this caveat.
 
 ## Base stack landmine (`--exclusively` is mandatory)
 
@@ -123,8 +138,14 @@ HyperPod stack; the VPC subnet imports resolve from the live Base exports regard
 
 - `stage-lifecycle.sh` — fetch the verified base-config bundle VERBATIM from the pinned commit
   (`34a09f12…`, MIT-0) and sync it to the cluster's `OnCreate` S3 prefix. Does NOT generate
-  provisioning_parameters.json (managed-Slurm mode — HyperPod does). `--dry-run` to preview.
-  Bump the `PIN` deliberately, never float to `main`.
+  provisioning_parameters.json (managed-Slurm mode — HyperPod does). It also copies
+  `fix_managed_slurm_conf.sh` into the bundle and wires it into the staged `on_create.sh` tail
+  (see the runtime gotcha above). `--dry-run` to preview. Bump the `PIN` deliberately, never
+  float to `main`.
+- `fix_managed_slurm_conf.sh` — OUR additive controller-side reconciliation of the managed
+  slurm.conf vs the verbatim base-config (comments the colliding `Include accounting.conf` +
+  `TopologyPlugin` directives, restarts slurmctld). Idempotent, controller-only, never-fatal.
+  Staged into the bundle and invoked from `on_create.sh` by `stage-lifecycle.sh`.
 - The launch script lives with the container: `containers/vla-ft/hyperpod_fsdp_launch.sh`.
 
 ## Verification status

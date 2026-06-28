@@ -105,9 +105,54 @@ fi
 # Belt-and-suspenders: if the upstream bundle ever ships one, drop it so it can't conflict.
 rm -f "${BUNDLE}/provisioning_parameters.json"
 
+# --- 2b. Inject the additive managed-Slurm reconciliation (verbatim files stay untouched) ---
+# Managed-Slurm's generated slurm.conf carries `Include accounting.conf` + `TopologyPlugin=
+# topology/tree`, which collide with the verbatim base-config's accounting.conf (GresTypes) and
+# its missing topology.conf → slurmctld crash-loops at first start (sinfo empty though the
+# cluster is InService). Rather than EDIT the pinned base-config (verified-lock), we ADD our own
+# fix script to the bundle and append one guarded call to on_create.sh's tail. on_create.sh's
+# only action is `python3 lifecycle_script.py` (which calls start_slurm.sh → `enable --now
+# slurmctld`); appending before its final `exit $exit_code` runs our reconciliation AFTER
+# slurmctld has started, which is exactly when the collision manifests. The fix is controller-
+# only, idempotent (sentinel marker), and never-fatal, so it is safe on every node and re-run.
+FIX_SRC="$(cd "$(dirname "$0")" && pwd)/fix_managed_slurm_conf.sh"
+if [[ ! -f "$FIX_SRC" ]]; then
+  echo "ERROR: expected fix script not found: $FIX_SRC" >&2
+  exit 1
+fi
+cp "$FIX_SRC" "${BUNDLE}/fix_managed_slurm_conf.sh"
+chmod +x "${BUNDLE}/fix_managed_slurm_conf.sh"
+# Append the call once, immediately before on_create.sh's final `exit $exit_code`. Guarded by a
+# marker so re-staging an already-patched bundle (or an upstream that changes the tail) is a
+# no-op. We patch the STAGED COPY in $WORK, never the pinned source tree.
+ONCREATE="${BUNDLE}/on_create.sh"
+if grep -q 'fix_managed_slurm_conf.sh' "$ONCREATE"; then
+  echo "      on_create.sh already wired for managed-Slurm fix — leaving as-is."
+elif grep -q '^exit \$exit_code' "$ONCREATE"; then
+  # Insert the guarded block on the line BEFORE `exit $exit_code`.
+  awk '
+    /^exit \$exit_code/ && !done {
+      print "";
+      print "# pai: reconcile managed-Slurm slurm.conf vs verbatim base-config (added by stage-lifecycle.sh).";
+      print "# Runs after lifecycle_script.py (incl. start_slurm.sh) so slurmctld has already started.";
+      print "if [[ -f fix_managed_slurm_conf.sh ]]; then";
+      print "  bash fix_managed_slurm_conf.sh || logger \"[WARN] managed-slurm reconcile skipped/failed\";";
+      print "fi";
+      print "";
+      done=1;
+    }
+    { print }
+  ' "$ONCREATE" > "${ONCREATE}.patched" && mv "${ONCREATE}.patched" "$ONCREATE"
+  echo "      on_create.sh patched: managed-Slurm fix call inserted before exit."
+else
+  echo "ERROR: on_create.sh tail changed upstream ('exit \$exit_code' not found) — cannot" >&2
+  echo "       safely inject the managed-Slurm fix. Review the pinned bundle before deploy." >&2
+  exit 1
+fi
+
 # --- 3. Validate the bundle's bash entrypoints parse (cheap pre-deploy gate) ----------------
 echo "[3/4] bash -n gate on entrypoints ..."
-for s in on_create.sh mount_fsx.sh start_slurm.sh; do
+for s in on_create.sh mount_fsx.sh start_slurm.sh fix_managed_slurm_conf.sh; do
   [[ -f "${BUNDLE}/${s}" ]] && bash -n "${BUNDLE}/${s}" && echo "      bash -n ok: ${s}"
 done
 python3 -m py_compile "${BUNDLE}/lifecycle_script.py" && echo "      py_compile ok: lifecycle_script.py"
