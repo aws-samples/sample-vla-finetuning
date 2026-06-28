@@ -21,7 +21,13 @@ import { HyperPodCluster, HyperPodInstanceGroup } from '../shared/hyperpod-clust
 export interface RlHyperPodStackProps extends cdk.StackProps {
   readonly base: SharedBaseStack;
   readonly namePrefix?: string;
-  /** Worker instance groups. Default: 2× ml.g6.12xlarge (4 GPU each) for distributed PPO. */
+  /**
+   * Cluster instance groups. Default: a Slurm controller (`controller-machine`,
+   * ml.c5.2xlarge ×1) PLUS 2× ml.g6.12xlarge workers (`worker-group-1`, 4 GPU each) for
+   * distributed PPO. A HyperPod Slurm cluster REQUIRES a dedicated controller group separate
+   * from the workers — see IlHyperPodStack for the rationale. Names must match the staged
+   * provisioning_parameters.json.
+   */
   readonly instanceGroups?: HyperPodInstanceGroup[];
   /** S3 URI (s3://sagemaker-...) of the Isaac Lab RL provisioning lifecycle scripts. */
   readonly lifecycleS3Uri?: string;
@@ -34,8 +40,10 @@ export class RlHyperPodStack extends cdk.Stack {
     super(scope, id, props);
 
     const namePrefix = props.namePrefix ?? 'pai';
+    // Slurm controller (head) group + GPU worker group(s) — see IlHyperPodStack.
     const instanceGroups = props.instanceGroups ?? [
-      { name: 'worker', instanceType: 'ml.g6.12xlarge', instanceCount: 2, ebsGb: 500 },
+      { name: 'controller-machine', instanceType: 'ml.c5.2xlarge', instanceCount: 1, ebsGb: 100, nodeType: 'Controller' as const },
+      { name: 'worker-group-1', instanceType: 'ml.g6.12xlarge', instanceCount: 2, ebsGb: 500, nodeType: 'Compute' as const },
     ];
 
     this.hyperPod = new HyperPodCluster(this, 'RlCluster', {

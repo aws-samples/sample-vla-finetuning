@@ -341,6 +341,43 @@ def test_orchestrator():
           "submit: handoff carries expert-only + HF token (matches verified launch.py)")
     check("--batch-size 4" in cmd, "submit: handoff per-device batch = decision (eff-batch lock)")
 
+    # ── image pin (reproducibility): a digest threads through plan → submit and PINS the
+    #    Pattern B handoff's --image-uri (overriding the stack's mutable B_IMAGE_URI hint).
+    DIGEST = "428.dkr.ecr.us-west-2.amazonaws.com/pai/vla-ft@sha256:574bb43"
+    plan_pin = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 20000,
+                        "image_uri": DIGEST})
+    check(plan_pin["submit"]["image_uri"] == DIGEST, "plan: image_uri threads into submit")
+    check(plan_pin["pattern"] == "B" and f"image      : {DIGEST}" in plan_pin["plan_text"]
+          and "launch.py --image-uri" in plan_pin["plan_text"],
+          "plan: Pattern B shows the image as PINNED in plan_text")
+    h_pin = osub._handoff_sagemaker(plan_pin["submit"], want_hf=True)
+    check(f"--image-uri {DIGEST}" in h_pin["handoff_command"],
+          "submit: caller image_uri (digest) overrides B_IMAGE_URI on the SM handoff")
+    # without a pin, the handoff falls back to the stack's B_IMAGE_URI (':latest') — unchanged.
+    check(":latest" in osub._handoff_sagemaker(plan_il["submit"], want_hf=True)["handoff_command"],
+          "submit: no image_uri → handoff uses the stack B_IMAGE_URI (back-compat)")
+    # Pattern A (Batch) cannot override the image per job → the pin is shown as ADVISORY,
+    # never silently dropped (honest: Batch reads the image from the Job Definition).
+    plan_pin_a = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200,
+                          "image_uri": DIGEST})
+    check(plan_pin_a["pattern"] == "A" and "ADVISORY" in plan_pin_a["plan_text"]
+          and DIGEST in plan_pin_a["plan_text"],
+          "plan: Pattern A shows image_uri as ADVISORY (Batch can't override per job)")
+
+    # ── DDP OOM-margin warning (P4): full-VLM full-FT on 1 node × multi-GPU replicates the
+    #    fp32 Adam state per GPU. WARN there; SILENT for expert_only / LoRA / single-GPU.
+    plan_fv_warn = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "full_vlm": True,
+                            "steps": 20000})
+    check(plan_fv_warn["submit"]["num_gpus"] > 1 and not plan_fv_warn["submit"]["expert_only"]
+          and "WARNING" in plan_fv_warn["plan_text"] and "DDP" in plan_fv_warn["plan_text"],
+          "plan: full-VLM full-FT multi-GPU 1-node → DDP OOM-margin WARNING")
+    check("WARNING" not in op.plan({"dataset": "s3://b/ds/", "model": "pi05",
+                                    "steps": 20000})["plan_text"],
+          "plan: expert_only default (the safe path) → no DDP warning")
+    check("WARNING" not in op.plan({"dataset": "s3://b/ds/", "model": "pi05", "lora": True,
+                                    "steps": 20000})["plan_text"],
+          "plan: LoRA (frozen base) → no DDP warning")
+
 
 # ── Per-job timeout + dual-queue spot/od (the MCP-only-FT controls) ──────────────────────
 def test_per_job_controls():

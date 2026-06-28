@@ -15,6 +15,7 @@ import sys
 import vla_status as st
 import vla_checkpoint as ck
 import vla_registry as rg
+import vla_aws as aws
 
 
 PASS, FAIL = 0, 0
@@ -280,6 +281,62 @@ check(len(q_gr) == 1 and q_gr[0]["id"] == "gr00t-G1", "query by engine=gr00t")
 q_ok = rg.query(m, consistency="OK")
 check(len(q_ok) == 1 and q_ok[0]["id"] == "vla-ft-pi05-A", "query by consistency=OK")
 check(rg.query(m)[0]["id"] == "gr00t-G1", "newest-first by registered_at")
+
+
+# ── ECR image-digest resolver (P2 diagnosis: did ':latest' drift under a run?) ────────
+print("image-digest resolver:")
+
+
+class _FakeEcr:
+    """Stand-in for the ECR client: records the describe_images call and returns a digest.
+    Lets us lock the URI parsing + degrade paths without a network/credentials."""
+    def __init__(self, digest="sha256:deadbeef", raise_exc=False):
+        self._digest, self._raise = digest, raise_exc
+        self.calls = []
+
+    def describe_images(self, repositoryName=None, imageIds=None):
+        self.calls.append((repositoryName, imageIds))
+        if self._raise:
+            raise RuntimeError("ImageNotFoundException")
+        return {"imageDetails": [{"imageDigest": self._digest}]}
+
+
+class _FakeSession:
+    def __init__(self, ecr):
+        self._ecr = ecr
+
+    def client(self, name):
+        assert name == "ecr"
+        return self._ecr
+
+
+# already-pinned digest ref → returned verbatim, NO ECR call (the reference IS the content).
+ecr0 = _FakeEcr()
+d0 = aws.resolve_image_digest(_FakeSession(ecr0),
+                              "428.dkr.ecr.us-west-2.amazonaws.com/pai/vla-ft@sha256:abc123")
+check(d0 == "sha256:abc123" and ecr0.calls == [], "pinned @sha256 ref returns digest, no ECR call")
+
+# mutable tag on a namespaced ECR repo → resolved via describe_images with the RIGHT repo+tag.
+ecr1 = _FakeEcr(digest="sha256:574bb43")
+d1 = aws.resolve_image_digest(_FakeSession(ecr1),
+                              "428.dkr.ecr.us-west-2.amazonaws.com/pai/vla-ft:latest")
+check(d1 == "sha256:574bb43", "mutable :latest tag resolves to current ECR digest")
+check(ecr1.calls == [("pai/vla-ft", [{"imageTag": "latest"}])],
+      "namespaced repo 'pai/vla-ft' + tag 'latest' split correctly (repo keeps the '/')")
+
+# non-ECR image (e.g. a public/DLC ref) → None, no call (the caller degrades cleanly).
+ecr2 = _FakeEcr()
+check(aws.resolve_image_digest(_FakeSession(ecr2), "nvcr.io/nvidia/pytorch:24.01-py3") is None
+      and ecr2.calls == [], "non-ECR image → None, no ECR call")
+
+# empty / missing → None.
+check(aws.resolve_image_digest(_FakeSession(_FakeEcr()), "") is None, "empty image_uri → None")
+
+# ECR error (tag deleted / no ecr:DescribeImages) → None, not an exception.
+ecr3 = _FakeEcr(raise_exc=True)
+check(aws.resolve_image_digest(_FakeSession(ecr3),
+                               "428.dkr.ecr.us-west-2.amazonaws.com/pai/vla-ft:efa") is None,
+      "ECR describe error → None (degrades, never raises)")
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

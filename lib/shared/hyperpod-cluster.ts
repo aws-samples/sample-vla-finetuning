@@ -44,6 +44,14 @@ export interface HyperPodInstanceGroup {
   readonly instanceCount: number;
   /** Per-instance EBS GB. Default 500 (image + dataset + checkpoints staging). */
   readonly ebsGb?: number;
+  /**
+   * Slurm node type for this group (CfnCluster SlurmConfig). A HyperPod Slurm cluster
+   * REQUIRES exactly one group with nodeType 'Controller'; the GPU workers are 'Compute'.
+   * CloudFormation rejects CREATE ("no InstanceGroup with Controller node type") if no
+   * group declares it. Allowed values: 'Controller' | 'Login' | 'Compute'. Default
+   * 'Compute' (workers are the common case) — the head group must set 'Controller'.
+   */
+  readonly nodeType?: 'Controller' | 'Login' | 'Compute';
 }
 
 export interface HyperPodClusterProps {
@@ -93,6 +101,15 @@ export class HyperPodCluster extends Construct {
     // Cluster nodes need: the HyperPod managed policy (cluster lifecycle, the
     // `sagemaker-` S3 prefix for lifecycle scripts) + our jobBasePolicy (dataset
     // read, artifact write, ECR pull of the training image).
+    //
+    // PLUS the VpcConfig permissions. AmazonSageMakerClusterInstanceRolePolicy grants
+    // logs/cloudwatch/s3(sagemaker-)/ssm but NO ec2 actions, so a VPC-configured cluster
+    // fails CREATE at validation with "Unable to retrieve subnets" (the execution role
+    // can't DescribeSubnets/DescribeVpcs). The canonical awslabs HyperPod reference ships
+    // these as a separate execution-role policy; we attach the two ec2 statements VERBATIM
+    // from the pinned source (1.AmazonSageMakerClustersExecutionRolePolicy.json @ 34a09f12,
+    // Sids AdditionToEnableVpcConfig / Addition2ToEnableVpcConfig) — a match-verified lock,
+    // not a hand-assembled permission set.
     this.clusterRole = new iam.Role(this, 'ClusterRole', {
       assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
       description: `HyperPod cluster instance role for ${props.clusterName}`,
@@ -100,19 +117,61 @@ export class HyperPodCluster extends Construct {
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSageMakerClusterInstanceRolePolicy'),
         base.jobBasePolicy,
       ],
+      inlinePolicies: {
+        EnableVpcConfig: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: 'AdditionToEnableVpcConfig',
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'ec2:CreateNetworkInterface',
+                'ec2:CreateNetworkInterfacePermission',
+                'ec2:DeleteNetworkInterface',
+                'ec2:DeleteNetworkInterfacePermission',
+                'ec2:DescribeNetworkInterfaces',
+                'ec2:DescribeVpcs',
+                'ec2:DescribeDhcpOptions',
+                'ec2:DescribeSubnets',
+                'ec2:DescribeSecurityGroups',
+                'ec2:DetachNetworkInterface',
+              ],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              sid: 'Addition2ToEnableVpcConfig',
+              effect: iam.Effect.ALLOW,
+              actions: ['ec2:CreateTags'],
+              resources: ['arn:aws:ec2:*:*:network-interface/*'],
+            }),
+          ],
+        }),
+      },
     });
 
-    // Cluster nodes communicate over NCCL (distributed training) — allow all traffic
-    // within the SG (self-referencing) plus egress for ECR/S3 over NAT.
+    // Cluster nodes communicate over NCCL (distributed training). Keep allowAllOutbound:true
+    // for the 0.0.0.0/0 egress that ECR image pulls + S3 (dataset/lifecycle) need over NAT.
     this.securityGroup = new ec2.SecurityGroup(this, 'ClusterSg', {
       vpc: base.vpc,
       allowAllOutbound: true,
-      description: `HyperPod ${props.clusterName} inter-node (NCCL) + egress`,
+      description: `HyperPod ${props.clusterName} inter-node (NCCL/EFA) + egress`,
     });
+    // Ingress: all traffic from self (the NCCL/rendezvous + EFA data plane source side).
     this.securityGroup.connections.allowInternally(
       ec2.Port.allTraffic(),
-      'HyperPod inter-node NCCL / distributed rendezvous',
+      'HyperPod inter-node NCCL / EFA RDMA (ingress self-ref)',
     );
+    // EFA RDMA ALSO requires an all-traffic egress rule that targets the SG BY REFERENCE
+    // (not the 0.0.0.0/0 CIDR allowAllOutbound gives). Without it, NCCL bootstrap over TCP
+    // succeeds but the EFA data plane fails the cross-node all-reduce with "Unreachable
+    // remote (never received a response)". The L2 connections.allowTo(self) is SILENTLY
+    // DROPPED when allowAllOutbound:true, so emit the rule at L1 (CfnSecurityGroupEgress).
+    // Verified by a 2-node 16-rank NCCL all-reduce (world=16, OK=True).
+    new ec2.CfnSecurityGroupEgress(this, 'ClusterSgEfaSelfEgress', {
+      groupId: this.securityGroup.securityGroupId,
+      ipProtocol: '-1',
+      destinationSecurityGroupId: this.securityGroup.securityGroupId,
+      description: 'HyperPod inter-node EFA RDMA (egress self-ref — required by EFA)',
+    });
 
     const subnetIds = base.vpc.selectSubnets({
       subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
@@ -137,6 +196,13 @@ export class HyperPodCluster extends Construct {
         instanceStorageConfigs: [
           { ebsVolumeConfig: { volumeSizeInGb: g.ebsGb ?? 500 } },
         ],
+        // Each group declares only its Slurm role. HyperPod CREATE fails ("no InstanceGroup
+        // with Controller node type") unless exactly one group is 'Controller'. We omit the
+        // optional CfnCluster PartitionNames: the verified awslabs flow names Slurm partitions
+        // from the staged provisioning_parameters.json (worker_groups[].partition_name), and
+        // the CfnCluster PartitionNames charset (^[a-zA-Z0-9](-*[a-zA-Z0-9])*$) rejects the
+        // instance-type dots anyway. Partition setup stays in the lifecycle bundle, by design.
+        slurmConfig: { nodeType: g.nodeType ?? 'Compute' },
       })),
       vpcConfig: {
         securityGroupIds: [this.securityGroup.securityGroupId],

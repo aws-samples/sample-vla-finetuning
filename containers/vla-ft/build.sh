@@ -17,7 +17,15 @@
 #
 # Usage:
 #   ./build.sh [--region us-west-2] [--repo pai/vla-ft] [--tag latest] [--local]
-# Output: prints the pushed image URI (feed to launch.py --image-uri).
+# Output: prints the pushed image URI AND its resolved @sha256 digest.
+#
+# Reproducibility (why the digest matters): `:latest` / `:efa` are MUTABLE — a later
+# build re-points them at new content, so an in-flight job that referenced the tag can
+# silently switch images (a 2026-06-25 ':latest' rebuild grew the GPU-memory baseline
+# and OOM'd a job that had fit on the prior image by <1 MiB). To make every build
+# pin-able, this script ALSO pushes an immutable provenance tag
+# (<variant>-<YYYYMMDD>-<gitsha>[-dirty]) next to the mutable tag and prints the
+# resolved digest. Pin a run to the digest (drift-proof): launch.py --image-uri ...@sha256:...
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
@@ -49,8 +57,20 @@ URI="${ECR}/${REPO}:${TAG}"
 # CodeBuild project names do not — derive a slash-free slug for those.
 REPO_SLUG="${REPO//\//-}"   # pai/vla-ft -> pai-vla-ft
 
+# Immutable provenance tag pushed ALONGSIDE the mutable one so any build is pin-able by
+# a stable name even before you read the digest. Form: <variant>-<YYYYMMDD>-<gitsha>[-dirty].
+# variant = the mutable tag (latest/efa) so ':latest' and ':efa' lines stay distinguishable.
+# gitsha is the build.sh repo HEAD (the image's only source is docker/Dockerfile, tracked
+# here); '-dirty' marks an uncommitted Dockerfile so a pinned tag never claims a clean commit.
+GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo nogit)"
+if ! git -C "$SCRIPT_DIR" diff --quiet -- docker/Dockerfile 2>/dev/null; then GIT_SHA="${GIT_SHA}-dirty"; fi
+BUILD_DATE="$(date -u +%Y%m%d)"
+IMMUTABLE_TAG="${TAG}-${BUILD_DATE}-${GIT_SHA}"
+IMMUTABLE_URI="${ECR}/${REPO}:${IMMUTABLE_TAG}"
+
 echo "Account: ${ACCOUNT}  Region: ${REGION}  Mode: ${MODE}"
 echo "Image:   ${URI}"
+echo "Pin tag: ${IMMUTABLE_URI}   (immutable; pushed alongside :${TAG})"
 
 # ECR repo: the platform's SharedBaseStack normally creates pai/vla-ft (RETAIN,
 # scan-on-push). Create-if-missing here too so build.sh works before/without the
@@ -58,16 +78,42 @@ echo "Image:   ${URI}"
 aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" >/dev/null 2>&1 \
   || aws ecr create-repository --repository-name "$REPO" --region "$REGION" >/dev/null
 
+# Resolve the pushed image's content digest from ECR (by the immutable tag, which the
+# build just put on the same manifest) and print the pin-ready summary. ECR is the source
+# of truth for the digest regardless of where the build ran (local or CodeBuild), so both
+# modes call this. A digest is drift-proof: ':latest' can move, ...@sha256:<digest> cannot.
+print_pushed() {
+  local how="$1"
+  local digest
+  digest="$(aws ecr describe-images --repository-name "$REPO" --region "$REGION" \
+    --image-ids imageTag="$IMMUTABLE_TAG" \
+    --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+  echo ""
+  echo "Pushed (${how}):"
+  echo "  mutable   : ${URI}"
+  echo "  immutable : ${IMMUTABLE_URI}"
+  if [ -n "$digest" ] && [ "$digest" != "None" ]; then
+    echo "  digest    : ${ECR}/${REPO}@${digest}"
+    echo ""
+    echo "Pin a run to the exact image (drift-proof) with the digest:"
+    echo "  python launch.py --image-uri ${ECR}/${REPO}@${digest} --policy pi05 --dataset-s3 s3://... --pretrained-path lerobot/pi05_base"
+  else
+    echo "  digest    : (could not resolve from ECR — pin by the immutable tag above)"
+  fi
+}
+
 # ───────────────────────────── local fallback ─────────────────────────────
 if [ "$MODE" = "local" ]; then
   aws ecr get-login-password --region "$REGION" \
     | docker login --username AWS --password-stdin "$ECR"
   # --platform linux/amd64 so the image runs on SageMaker GPU hosts even when built on arm64 (M-series).
+  # Tag the SAME build with both the mutable handle and the immutable provenance tag, then
+  # push both (same manifest → same digest, two names pointing at it).
   docker build --platform linux/amd64 --build-arg ENABLE_EFA="${ENABLE_EFA}" \
-    -t "$URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
+    -t "$URI" -t "$IMMUTABLE_URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
   docker push "$URI"
-  echo ""
-  echo "Pushed (local): ${URI}"
+  docker push "$IMMUTABLE_URI"
+  print_pushed "local"
   exit 0
 fi
 
@@ -109,13 +155,13 @@ TMP_ZIP="$(mktemp -d)/source.zip"
 aws s3 cp "$TMP_ZIP" "s3://${SRC_BUCKET}/${SRC_KEY}" --region "$REGION" >/dev/null
 echo "Source uploaded: s3://${SRC_BUCKET}/${SRC_KEY}"
 
-# 3. Buildspec: ECR login -> buildkit build -> push.
+# 3. Buildspec: ECR login -> buildkit build (mutable + immutable tag on one manifest) -> push both.
 BUILDSPEC="{
   \"version\":\"0.2\",
   \"phases\":{
     \"pre_build\":{\"commands\":[\"aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR}\"]},
-    \"build\":{\"commands\":[\"DOCKER_BUILDKIT=1 docker build --build-arg ENABLE_EFA=${ENABLE_EFA} -t ${URI} .\"]},
-    \"post_build\":{\"commands\":[\"docker push ${URI}\"]}
+    \"build\":{\"commands\":[\"DOCKER_BUILDKIT=1 docker build --build-arg ENABLE_EFA=${ENABLE_EFA} -t ${URI} -t ${IMMUTABLE_URI} .\"]},
+    \"post_build\":{\"commands\":[\"docker push ${URI}\",\"docker push ${IMMUTABLE_URI}\"]}
   }
 }"
 
@@ -161,6 +207,4 @@ if [ "$STATUS" != "SUCCEEDED" ]; then
   exit 1
 fi
 
-echo ""
-echo "Pushed (CodeBuild): ${URI}"
-echo "Next: python launch.py --image-uri ${URI} --policy pi05 --dataset-s3 s3://... --pretrained-path lerobot/pi05_base"
+print_pushed "CodeBuild"

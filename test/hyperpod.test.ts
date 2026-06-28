@@ -39,6 +39,24 @@ describe('IlHyperPodStack', () => {
     });
   });
 
+  test('cluster has a dedicated Slurm controller group + the GPU worker group (Slurm needs both)', () => {
+    const clusters = t.findResources('AWS::SageMaker::Cluster');
+    const groups = (Object.values(clusters)[0] as any).Properties.InstanceGroups as any[];
+    const controller = groups.find((g) => g.InstanceGroupName === 'controller-machine');
+    const worker = groups.find((g) => g.InstanceGroupName === 'worker-group-1');
+    expect(controller).toBeDefined();
+    expect(controller.InstanceType).toBe('ml.c5.2xlarge');
+    expect(controller.InstanceCount).toBe(1);
+    expect(worker).toBeDefined();
+    expect(worker.InstanceType).toBe('ml.g6e.48xlarge');
+    expect(worker.InstanceCount).toBe(2);
+    // SlurmConfig node types: CREATE fails ("no InstanceGroup with Controller node type")
+    // unless exactly one group is Controller and the GPU group is Compute. Regression lock
+    // for the 1-shot deploy gap.
+    expect(controller.SlurmConfig.NodeType).toBe('Controller');
+    expect(worker.SlurmConfig.NodeType).toBe('Compute');
+  });
+
   test('lifecycle S3 URI uses the HyperPod-required sagemaker- prefix', () => {
     const clusters = t.findResources('AWS::SageMaker::Cluster');
     const cluster = Object.values(clusters)[0] as any;
@@ -55,6 +73,34 @@ describe('IlHyperPodStack', () => {
     const arns = JSON.stringify(hyperpodRole.Properties.ManagedPolicyArns);
     expect(arns).toContain('AmazonSageMakerClusterInstanceRolePolicy');
     expect(arns).toContain('JobBasePolicy');
+  });
+
+  test('cluster role grants VpcConfig ec2 permissions (DescribeSubnets etc.)', () => {
+    // Regression lock: the managed instance-role policy has NO ec2 actions, so a
+    // VPC-configured cluster fails CREATE with "Unable to retrieve subnets" unless the
+    // execution role also carries the awslabs AdditionToEnableVpcConfig statement. It
+    // renders as an inline policy on the Role (Properties.Policies), not a standalone
+    // AWS::IAM::Policy — assert it there so this 1-shot deploy gap can't silently reappear.
+    const roles = t.findResources('AWS::IAM::Role');
+    const hyperpodRole = Object.values(roles).find(
+      (r: any) => r.Properties.AssumeRolePolicyDocument.Statement[0].Principal.Service === 'sagemaker.amazonaws.com',
+    ) as any;
+    const inline = JSON.stringify(hyperpodRole.Properties.Policies);
+    expect(inline).toContain('ec2:DescribeSubnets');
+    expect(inline).toContain('ec2:DescribeVpcs');
+    expect(inline).toContain('ec2:CreateNetworkInterface');
+  });
+
+  test('cluster SG has the EFA-required self-referencing egress rule', () => {
+    // Regression lock: EFA RDMA needs an all-traffic egress rule targeting the SG by
+    // reference (not the 0.0.0.0/0 CIDR). Without it cross-node NCCL all-reduce fails with
+    // "Unreachable remote". Emitted as a standalone CfnSecurityGroupEgress (the L2 form is
+    // silently dropped under allowAllOutbound:true).
+    const egress = t.findResources('AWS::EC2::SecurityGroupEgress');
+    const selfRef = Object.values(egress).find(
+      (e: any) => e.Properties.IpProtocol === '-1' && e.Properties.DestinationSecurityGroupId,
+    );
+    expect(selfRef).toBeDefined();
   });
 
   test('node recovery is Automatic (HyperPod resilience)', () => {
@@ -105,11 +151,12 @@ describe('RlHyperPodStack', () => {
   const stack = new RlHyperPodStack(app, 'TestRlHyperPod', { env: ENV, namePrefix: 'pai', base });
   const t = Template.fromStack(stack);
 
-  test('synthesizes one HyperPod CfnCluster with the RL default instance group', () => {
+  test('synthesizes one HyperPod CfnCluster with the RL controller + worker groups', () => {
     t.resourceCountIs('AWS::SageMaker::Cluster', 1);
     t.hasResourceProperties('AWS::SageMaker::Cluster', {
       InstanceGroups: Match.arrayWith([
-        Match.objectLike({ InstanceType: 'ml.g6.12xlarge', InstanceCount: 2 }),
+        Match.objectLike({ InstanceGroupName: 'controller-machine', InstanceType: 'ml.c5.2xlarge' }),
+        Match.objectLike({ InstanceGroupName: 'worker-group-1', InstanceType: 'ml.g6.12xlarge', InstanceCount: 2 }),
       ]),
     });
   });
@@ -121,7 +168,11 @@ describe('RlHyperPodStack', () => {
       env: ENV,
       namePrefix: 'pai',
       base: base2,
-      instanceGroups: [{ name: 'worker', instanceType: 'ml.p5.48xlarge', instanceCount: 4 }],
+      // A valid Slurm cluster needs a Controller group; keep it in the override example.
+      instanceGroups: [
+        { name: 'controller-machine', instanceType: 'ml.c5.2xlarge', instanceCount: 1, nodeType: 'Controller' },
+        { name: 'worker', instanceType: 'ml.p5.48xlarge', instanceCount: 4, nodeType: 'Compute' },
+      ],
     });
     const t2 = Template.fromStack(s2);
     t2.hasResourceProperties('AWS::SageMaker::Cluster', {

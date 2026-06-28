@@ -94,6 +94,7 @@ def submit_finetune(
     max_iterations: int | None = None,
     num_gpus: int = 1,
     num_nodes: int = 1,
+    image_uri: str | None = None,
     select_best: bool = False,
     val_episodes: int | None = None,
     early_stop_patience: int | None = None,
@@ -142,6 +143,17 @@ def submit_finetune(
     hyperpod_fsdp_launch.sh on the cluster head). num_nodes=1 (default) uses the runnable
     single-node Pattern A/B.
 
+    IMAGE PIN (reproducibility): pass image_uri to pin the training container to an EXACT
+    image — use a digest (...amazonaws.com/pai/vla-ft@sha256:<digest>, from build.sh's output)
+    so a later ':latest' rebuild can never silently change the image under a run. This is the
+    drift guard for the case where a mutable ':latest' rebuild grew the GPU-memory baseline and
+    OOM'd a job that had fit on the prior image. It applies to the SageMaker path (Pattern B):
+    the pin flows into the launch.py --image-uri of the returned handoff command. NOTE: the
+    Batch paths (Pattern A — short IL / RL / GR00T) read the image from their deployed Job
+    Definition, which Batch cannot override per job; for those, image_uri is reported in the
+    plan as advisory (rebuild :latest + redeploy, or pin via the Job Definition) rather than
+    silently ignored. Omit image_uri → the deployed default (':latest').
+
     SAFETY: dry_run defaults to True — it returns the resolved plan + cost estimate WITHOUT
     launching (and without needing creds for the plan). Call again with dry_run=False to
     actually submit (incurs GPU cost). For GR00T UNITREE_G1, the platform auto-sets
@@ -155,6 +167,7 @@ def submit_finetune(
         "task": task,
         "num_gpus": num_gpus,
         "num_nodes": num_nodes,
+        "image_uri": image_uri,
         "full_vlm": full_vlm,
         "lora": lora,
         "lora_r": lora_r,
@@ -305,7 +318,14 @@ def list_my_jobs(intent: str = "il", region: str | None = None, max_results: int
 @mcp.tool()
 def get_job(job_id: str, region: str | None = None) -> dict:
     """The resolved config of one job (model, dataset, steps, ft-mode, horizon, output
-    prefix) read from its Batch container env — 'what did I run, with what config?'."""
+    prefix) read from its Batch container env — 'what did I run, with what config?'.
+
+    Also reports image provenance: image_uri is the container image the job was launched
+    with, and image_digest is what that reference resolves to in ECR RIGHT NOW. A mutable
+    tag (':latest') records no content identity, so a later rebuild can move it under a
+    finished run — comparing image_digest across two runs of the same tag reveals that drift
+    (the failure mode where a ':latest' rebuild grew the image and OOM'd a job that had fit
+    the prior one). image_digest is None for non-ECR images or if ECR can't be read."""
     sess = aws.session(region)
     job = aws.describe_job(sess, job_id)
     if not job:
@@ -313,11 +333,14 @@ def get_job(job_id: str, region: str | None = None) -> dict:
     container = job.get("container", {}) or {}
     env = {e["name"]: e.get("value") for e in container.get("environment", []) or []}
     hp = _hp_from_job(sess, env)
+    image_uri = container.get("image")
     return {
         "job_id": job.get("jobId"),
         "job_name": job.get("jobName"),
         "status": job.get("status"),
         "engine": status.classify_engine(job.get("jobName", "")),
+        "image_uri": image_uri,
+        "image_digest": aws.resolve_image_digest(sess, image_uri) if image_uri else None,
         "dataset_s3": env.get("VLA_FT_DATASET_S3") or env.get("GROOT_DATASET_S3"),
         "output_s3": (env.get("VLA_FT_OUTPUT_S3") or env.get("RL_OUTPUT_S3")
                       or env.get("GROOT_OUTPUT_S3")),

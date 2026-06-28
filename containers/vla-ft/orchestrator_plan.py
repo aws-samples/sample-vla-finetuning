@@ -111,6 +111,10 @@ def _il_plan(event: dict) -> dict:
         "instance_type": decision.instance_type,
         "sm_instance_type": decision.sm_instance_type,
         "spot": decision.spot,
+        # Exact-image pin (reproducibility). Applied as launch.py --image-uri on the
+        # Pattern B (SageMaker) handoff; advisory on Pattern A (Batch reads its image from
+        # the deployed Job Definition — no per-job override). None → the deployed default.
+        "image_uri": event.get("image_uri"),
         "expert_only": decision.expert_only,
         # LoRA (full-VLM-on-one-GPU; mutually exclusive with expert_only — resolve_ft_mode
         # already makes --lora win over the expert-only default, so expert_only is False here).
@@ -165,6 +169,7 @@ def _groot_plan(event: dict) -> dict:
         "learning_rate": event.get("learning_rate"),
         "num_gpus": decision.num_gpus,
         "instance_type": decision.instance_type,
+        "image_uri": event.get("image_uri"),  # advisory on Batch (see _il_plan / _envelope)
         "liveness_deadline_s": event.get("liveness_deadline_s"),
         "extra": event.get("extra") or [],
         # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
@@ -202,6 +207,7 @@ def _rl_plan(event: dict) -> dict:
         "seed": event.get("seed"),
         "num_gpus": decision.num_gpus,
         "instance_type": decision.instance_type,
+        "image_uri": event.get("image_uri"),  # advisory on Batch (see _il_plan / _envelope)
         "skip_export": bool(event.get("skip_export", False)),
         "overrides": event.get("overrides") or [],
         # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
@@ -221,6 +227,33 @@ def _envelope(axis: str, profile, decision, submit: dict, plan_text: str) -> dic
     if timeout_s:
         plan_text = f"{plan_text}\n  timeout    : {timeout_s / 3600:g} h " \
                     f"({timeout_s} s, per-job override of the JobDefinition default)"
+    # Exact-image pin. Pattern B (SageMaker) honors it (launch.py --image-uri); Pattern A
+    # (Batch) reads its image from the deployed Job Definition and CANNOT override per job,
+    # so the pin is shown as advisory there rather than silently dropped. Pattern C is a
+    # recommend-only reference (no auto-submit), so the pin is documented but not wired.
+    image_uri = submit.get("image_uri")
+    if image_uri:
+        if decision.pattern == "B":
+            plan_text = f"{plan_text}\n  image      : {image_uri} (pinned → launch.py --image-uri)"
+        else:
+            plan_text = (f"{plan_text}\n  image      : {image_uri} "
+                         f"(ADVISORY — Pattern {decision.pattern} reads its image from the deployed "
+                         f"Job Definition; Batch cannot override the image per job. To run this exact "
+                         f"image: rebuild :latest from it + redeploy, or pin it in the Job Definition.)")
+    # OOM-margin warning: a full-VLM full fine-tune (not expert_only, not LoRA) on a SINGLE
+    # node with MULTIPLE GPUs runs under accelerate DDP, which REPLICATES the fp32 Adam
+    # optimizer state on every GPU — so adding GPUs does NOT shrink per-GPU memory. The
+    # replica + optimizer fit is paper-thin on L40S (44 GB usable), and a slightly larger
+    # image baseline can tip it into a step-0 OOM. Surface the cheaper-footprint levers.
+    if (axis == "il" and int(submit.get("num_nodes", 1) or 1) == 1
+            and int(submit.get("num_gpus", 1) or 1) > 1
+            and not submit.get("expert_only") and not submit.get("lora")):
+        plan_text = (f"{plan_text}\n  WARNING    : full-VLM full fine-tune on 1 node x "
+                     f"{submit['num_gpus']} GPU uses DDP (fp32 Adam state replicated per GPU "
+                     f"— extra GPUs do NOT reduce per-GPU memory). The fit is tight on L40S; an "
+                     f"image-baseline bump can OOM at step 0. Lower-footprint options: --lora "
+                     f"(base frozen, optimizer state ~MB), train_expert_only, or multi-node FSDP "
+                     f"(num_nodes>1, shards the optimizer state).")
     return {
         "axis": axis,
         "pattern": decision.pattern,

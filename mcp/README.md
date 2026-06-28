@@ -30,10 +30,10 @@ and picks the engine + backend:
 
 | Tool | The requester's question | Returns |
 |---|---|---|
-| `submit_finetune` | "start the FT, pick the engine + backend for me" | resolved plan (engine/backend/instance/**cost**) + `job_id` + the **output S3 prefix** it writes to. Routes lerobot · GR00T · RL. `dry_run=True` by default (plan only, no launch, no creds). |
+| `submit_finetune` | "start the FT, pick the engine + backend for me" | resolved plan (engine/backend/instance/**cost**) + `job_id` + the **output S3 prefix** it writes to. Routes lerobot · GR00T · RL. `dry_run=True` by default (plan only, no launch, no creds). `image_uri` pins the container to an exact image (digest) — drift guard against a `:latest` rebuild changing the image under a run (honored on the SageMaker path; advisory on Batch). |
 | `get_job_status` | "is it **really** training? loss? step? or stalled?" | enriched verdict: `batch_status, elapsed_s, learning, liveness_ok, latest_step, latest_loss, latest_epoch (GR00T), latest_reward (RL), output_s3, summary`. **One call answers "RUNNING ≠ learning."** |
 | `list_my_jobs` | "what's on the queue?" | recent Batch jobs (newest first) for the `il` (lerobot), `gr00t`, or `rl` queue. |
-| `get_job` | "what config did I run?" | resolved model/dataset/steps/ft-mode/horizon/output from the job's env. |
+| `get_job` | "what config + which image did I run?" | resolved model/dataset/steps/ft-mode/horizon/output from the job's env, plus `image_uri` and the digest it resolves to **now** (`image_digest`) — compare across two runs of the same tag to catch `:latest` drift. |
 | `describe_checkpoint` | "give me a checkpoint I can load — is it internally consistent?" | `kind, consistency (OK\|MISMATCH\|UNKNOWN), adapter_only, base_model, model_action_horizon, processor_action_horizon, files, loadable_hint`. **The GR00T 40/50 horizon gate.** |
 | `register_checkpoint` / `list_checkpoints` | "remember what I trained / which are validated" | S3-manifest registry, idempotent by job name. |
 
@@ -82,7 +82,7 @@ mcp/
   vla_checkpoint.py  pure: adapter/merged classify + GR00T horizon consistency gate
   vla_registry.py    pure: S3-manifest schema (upsert/query)
   vla_aws.py         boto3 I/O + in-process reuse of orchestrator_plan/submit
-  test_mcp.py        43 self-contained asserts (no pytest), real log lines + config keys
+  test_mcp.py        65 self-contained asserts (no pytest), real log lines + config keys
   requirements.txt   mcp + boto3 (core imported from ../containers/vla-ft/)
 ```
 
@@ -92,7 +92,7 @@ mcp/
 # dedicated venv
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 # smoke the tools
-python test_mcp.py            # 43/43, pure, offline
+python test_mcp.py            # 65/65, pure, offline
 python server.py              # stdio server (Ctrl-C to stop)
 ```
 

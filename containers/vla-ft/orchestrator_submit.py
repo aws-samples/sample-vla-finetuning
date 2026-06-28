@@ -303,7 +303,11 @@ def _handoff_sagemaker(submit: dict, *, want_hf: bool) -> dict:
     command keeps the orchestrator's decision value while leaving the actual submit to
     the verified launcher (run by an operator or CI)."""
     role = _env("B_EXECUTION_ROLE")
-    image = _env("B_IMAGE_URI")
+    # Exact-image pin (reproducibility): a caller-supplied image_uri (ideally a digest) wins
+    # over the stack's B_IMAGE_URI hint (which is the mutable ':latest'). This is the launcher
+    # path that actually accepts an image (launch.py --image-uri), so the pin takes effect here
+    # — the drift guard against a ':latest' rebuild changing the image under a run.
+    image = submit.get("image_uri") or _env("B_IMAGE_URI")
     output_s3 = _env("B_OUTPUT_S3")
     instance = submit.get("sm_instance_type") or f"ml.{submit['instance_type']}"
     argv = [

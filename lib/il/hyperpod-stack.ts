@@ -21,7 +21,16 @@ import { HyperPodCluster, HyperPodInstanceGroup } from '../shared/hyperpod-clust
 export interface IlHyperPodStackProps extends cdk.StackProps {
   readonly base: SharedBaseStack;
   readonly namePrefix?: string;
-  /** Worker instance groups. Default: 2× ml.g6e.48xlarge (8×L40S each = 16 GPU). */
+  /**
+   * Cluster instance groups. Default: a Slurm controller (`controller-machine`,
+   * ml.c5.2xlarge ×1) PLUS 2× ml.g6e.48xlarge workers (`worker-group-1`, 8×L40S each =
+   * 16 GPU). A HyperPod *Slurm* cluster REQUIRES a dedicated controller group separate
+   * from the workers (the lifecycle_script.py looks up `controller_group` by name and a
+   * single group cannot be both head + compute) — a worker-only cluster never forms Slurm.
+   * The group names here MUST match the `controller_group` / `worker_groups[].instance_group_name`
+   * in the staged provisioning_parameters.json (see scripts/hyperpod/stage-lifecycle.sh).
+   * An operator overriding this MUST keep a controller group.
+   */
   readonly instanceGroups?: HyperPodInstanceGroup[];
   /**
    * S3 URI (must start with s3://sagemaker-) of the openvla provisioning lifecycle
@@ -48,8 +57,14 @@ export class IlHyperPodStack extends cdk.Stack {
     super(scope, id, props);
 
     const namePrefix = props.namePrefix ?? 'pai';
+    // A Slurm HyperPod cluster needs a dedicated controller (head) group + worker group(s).
+    // Controller is a small CPU box (ml.c5.2xlarge — cluster quota is broadly available,
+    // unlike the g-series); workers are the GPU compute. The group names are the verified
+    // awslabs convention (`controller-machine` / `worker-group-1`) and MUST match the staged
+    // provisioning_parameters.json controller_group / worker_groups[].instance_group_name.
     const instanceGroups = props.instanceGroups ?? [
-      { name: 'worker', instanceType: 'ml.g6e.48xlarge', instanceCount: 2, ebsGb: 500 },
+      { name: 'controller-machine', instanceType: 'ml.c5.2xlarge', instanceCount: 1, ebsGb: 100, nodeType: 'Controller' as const },
+      { name: 'worker-group-1', instanceType: 'ml.g6e.48xlarge', instanceCount: 2, ebsGb: 500, nodeType: 'Compute' as const },
     ];
 
     this.hyperPod = new HyperPodCluster(this, 'IlCluster', {

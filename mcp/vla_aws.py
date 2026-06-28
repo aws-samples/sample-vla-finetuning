@@ -170,6 +170,37 @@ def describe_job(sess: boto3.Session, job_id: str) -> dict | None:
     return jobs[0] if jobs else None
 
 
+def resolve_image_digest(sess: boto3.Session, image_uri: str) -> str | None:
+    """Resolve an ECR image reference to its CURRENT content digest (sha256:...), or None.
+
+    The reproducibility diagnosis: a Batch job records the image it was launched with as a
+    URI (e.g. .../pai/vla-ft:latest) — a MUTABLE tag, not pinned to content. This resolves
+    what that tag points at NOW. Compared against the digest a run actually used (if recorded
+    elsewhere) it tells you whether ':latest' drifted under the run — the exact failure mode
+    where a later rebuild grew the image and OOM'd a job that had fit the prior one.
+
+    Already-pinned digest refs (...@sha256:<digest>) return that digest unchanged (no call).
+    ECR-only; non-ECR images (or unreadable repos) return None so the caller degrades cleanly."""
+    if not image_uri:
+        return None
+    if "@sha256:" in image_uri:
+        return image_uri.split("@", 1)[1]  # already pinned — the digest IS the reference
+    if ".dkr.ecr." not in image_uri:
+        return None                         # not an ECR image (e.g. a DLC/public ref)
+    # Split <registry>/<repo>:<tag> — repo names may contain '/', tags never do.
+    after_host = image_uri.split("/", 1)[1] if "/" in image_uri else image_uri
+    repo, _, tag = after_host.rpartition(":")
+    if not repo or not tag:
+        return None
+    try:
+        resp = sess.client("ecr").describe_images(
+            repositoryName=repo, imageIds=[{"imageTag": tag}])
+        details = resp.get("imageDetails", [])
+        return details[0].get("imageDigest") if details else None
+    except Exception:  # noqa: BLE001 — repo/tag gone or no ecr:DescribeImages → degrade to None
+        return None
+
+
 def job_facts(job: dict) -> dict:
     """Extract the status-enrichment inputs from a Batch job object.
 
