@@ -66,6 +66,12 @@ def parse_args():
                    help="GPUs to train across on the node (>1 → torchrun + --distributed).")
     p.add_argument("--region", default=None)
     p.add_argument("--job-name", default=None, help="Override the auto job name.")
+    p.add_argument("--timeout-hours", type=float, default=None, metavar="HOURS",
+                   help="Per-job Batch attempt timeout (SubmitJob timeout.attemptDurationSeconds; "
+                        "omit = JobDefinition default). Right-size it to the run: a 100-iter smoke "
+                        "should be ~0.5 h, not the 12 h JobDef default (a boot-hang on the 12 h "
+                        "default bills ~12 h of GPU for a job that should take minutes). Floored at "
+                        "Batch's 60 s minimum.")
     return p.parse_args()
 
 
@@ -122,11 +128,21 @@ def main():
     if resource_overrides:
         container_overrides["resourceRequirements"] = resource_overrides
 
+    # Per-job attempt timeout override (omit = JobDefinition default; no redeploy).
+    # Floor at Batch's 60 s minimum so a fat-fingered tiny value can't submit an instant-kill.
+    timeout_kwarg = {}
+    if args.timeout_hours is not None:
+        timeout_kwarg = {"timeout": {
+            "attemptDurationSeconds": max(60, int(round(args.timeout_hours * 3600)))}}
+        print(f"  timeout   : {args.timeout_hours:g} h "
+              f"({timeout_kwarg['timeout']['attemptDurationSeconds']} s, per-job override)")
+
     resp = sess.client("batch", region_name=region).submit_job(
         jobName=job_name,
         jobQueue=args.job_queue,
         jobDefinition=args.job_definition,
         containerOverrides=container_overrides,
+        **timeout_kwarg,
     )
     print(f"Submitted Batch job id: {resp['jobId']}")
     print(f"Track: aws batch describe-jobs --jobs {resp['jobId']} --region {region} "

@@ -95,6 +95,10 @@ def parse_args():
                    help="RL only: PPO iterations (omit = task-registered default).")
     p.add_argument("--num-gpus", type=int, default=1,
                    help="RL only: GPUs on the node (>1 → torchrun multi-GPU PPO).")
+    p.add_argument("--liveness-deadline", type=int, default=None, metavar="SECONDS",
+                   help="RL only: liveness-guard grace seconds (RL_LIVENESS_DEADLINE_S; "
+                        "omit = bootstrap default 1200; 0 = off). Raise it for a heavy task "
+                        "whose Isaac Sim boot + first iteration exceeds 20 min.")
     p.add_argument("--quickstart", action="store_true",
                    help="Fill --dataset with the verified OpenArm-lift set + --model pi05 "
                         "if unset, for a one-command end-to-end run.")
@@ -156,6 +160,16 @@ def parse_args():
                         "effective batch becomes 2 x num_gpus — a different trajectory).")
 
     # Plumbing.
+    # Pattern A only: batch_launch.py turns this into submit_job timeout.attemptDurationSeconds,
+    # which Batch enforces with a SIGKILL. Omitting it leaves the DEPLOYED JobDefinition default
+    # (measured 2026-09-11: 100800 s = 28 h), sized for a 20000-step full-VLM run — so a short
+    # LoRA job that hangs would bill ~28 h of GPU instead of its ~4 h plan. Pattern B (SageMaker)
+    # has no equivalent knob in launch.py, so the CLI refuses the combination rather than
+    # accepting a flag it would silently drop.
+    p.add_argument("--timeout-hours", type=float, default=None,
+                   help="Per-job wall-clock ceiling in hours (Pattern A / Batch only). "
+                        "Overrides the deployed JobDefinition default for THIS job only. "
+                        "Size it to the plan's est time plus headroom.")
     p.add_argument("--region", default=None, help=f"AWS region (default {DEFAULT_REGION}).")
     p.add_argument("--hf-token-ssm", default=None,
                    help=f"SSM SecureString with an HF token (default {DEFAULT_HF_TOKEN_SSM} "
@@ -316,10 +330,23 @@ def build_pattern_a_argv(args, decision, outputs, region, hf_ssm, hf_region, wan
     if missing:
         raise SystemExit(f"Pattern A stack missing outputs {missing} — is "
                          f"{STACK_PATTERN_A} deployed?")
+    # The SPOT compute environment mixes card sizes (measured 2026-09-14, ap-northeast-2:
+    # g6e.4xlarge 48 GB + g5.4xlarge 24 GB) and the job definition requests a GPU *count*,
+    # not a size — so a large replica can land on the small card and OOM at step 0.
+    # Honour decision.spot by selecting the single-instance-type On-Demand queue instead.
+    # Fail loudly when it is absent: falling back to the SPOT queue is what caused that OOM.
+    queue = vals["JobQueueArn"]
+    if not decision.spot:
+        queue = outputs.get("JobQueueArnOnDemand")
+        if not queue:
+            raise SystemExit(
+                f"On-Demand was selected but {STACK_PATTERN_A} exposes no "
+                f"JobQueueArnOnDemand output - refusing to submit to the SPOT queue "
+                f"(mixed card sizes risk an OOM). Redeploy the stack or pass Spot.")
     argv = [
         "--policy", args.model,
         "--dataset-s3", args.dataset,
-        "--job-queue", vals["JobQueueArn"],
+        "--job-queue", queue,
         "--job-definition", vals["JobDefinitionArn"],
         "--code-s3", vals["CodeS3Hint"],
         "--output-s3", vals["OutputS3Hint"],
@@ -327,6 +354,8 @@ def build_pattern_a_argv(args, decision, outputs, region, hf_ssm, hf_region, wan
         "--batch-size", str(decision.per_device_batch),
         "--region", region,
     ]
+    if args.timeout_hours is not None:
+        argv += ["--timeout-hours", str(args.timeout_hours)]
     if args.pretrained_path:
         argv += ["--pretrained-path", args.pretrained_path]
     if decision.expert_only:
@@ -363,7 +392,20 @@ def build_rl_argv(args, decision, outputs, region):
         argv += ["--num-envs", str(args.num_envs)]
     if args.max_iterations is not None:
         argv += ["--max-iterations", str(args.max_iterations)]
+    if getattr(args, "liveness_deadline", None) is not None:
+        argv += ["--liveness-deadline", str(args.liveness_deadline)]
     return argv
+
+
+def _launcher_supports(script_path, flag):
+    """Whether the launcher declares `flag`. Returns None when it cannot be determined —
+    the caller must treat that as 'do not submit', not as 'unsupported' or 'supported'."""
+    try:
+        with open(script_path, encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    return f'"{flag}"' in src or f"'{flag}'" in src
 
 
 def _lora_flags(args, decision):
@@ -576,6 +618,25 @@ def main():
                   "--skip-preflight to bypass.", file=sys.stderr)
             raise SystemExit(1)
 
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here,
+                          "batch_launch.py" if decision.pattern == "A" else "launch.py")
+
+    # A dropped ceiling is worse than a rejected one: the job would run under the deployed
+    # JobDefinition default (28 h) while the operator believes their tighter limit applied.
+    # Support is read from the chosen launcher, not asserted per pattern, so this follows
+    # automatically if launch.py gains the flag.
+    if args.timeout_hours is not None:
+        supported = _launcher_supports(script, "--timeout-hours")
+        if supported is None:
+            raise SystemExit(f"--timeout-hours: cannot tell whether {os.path.basename(script)} "
+                             f"accepts it (launcher unreadable) — refusing to submit rather "
+                             f"than risk dropping the ceiling.")
+        if not supported:
+            raise SystemExit(f"--timeout-hours is not supported by "
+                             f"{os.path.basename(script)} (Pattern {decision.pattern}); it "
+                             f"would be silently dropped. Pattern A (Batch) supports it.")
+
     # ── gate ──
     if args.dry_run or not args.yes:
         reason = "--dry-run" if args.dry_run else "no --yes"
@@ -584,12 +645,9 @@ def main():
         return
 
     # ── 5. launch the UNCHANGED verified launcher ──
-    here = os.path.dirname(os.path.abspath(__file__))
     if decision.pattern == "A":
-        script = os.path.join(here, "batch_launch.py")
         argv = build_pattern_a_argv(args, decision, outputs, region, hf_ssm, hf_region, want_hf)
     else:
-        script = os.path.join(here, "launch.py")
         argv = build_pattern_b_argv(args, decision, outputs, region, hf_ssm, hf_region, want_hf)
 
     cmd = [sys.executable, script] + argv

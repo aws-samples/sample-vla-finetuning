@@ -70,6 +70,35 @@ class DeadlineParseTest(unittest.TestCase):
         self.assertEqual(boot._liveness_deadline_s(), boot.DEFAULT_LIVENESS_DEADLINE_S)
 
 
+class PlayExportTimeoutParseTest(unittest.TestCase):
+    """The play.py export runs under a bounded timeout because play.py loops forever
+    after writing exported/. Unlike the liveness guard, 0 must NOT disable it — an
+    unbounded export would re-introduce the very hang this timeout exists to prevent."""
+    def setUp(self):
+        self._saved = os.environ.pop("RL_PLAY_EXPORT_TIMEOUT_S", None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ["RL_PLAY_EXPORT_TIMEOUT_S"] = self._saved
+        else:
+            os.environ.pop("RL_PLAY_EXPORT_TIMEOUT_S", None)
+
+    def test_default_when_unset(self):
+        self.assertEqual(boot._play_export_timeout_s(), boot.DEFAULT_PLAY_EXPORT_TIMEOUT_S)
+
+    def test_explicit_value(self):
+        os.environ["RL_PLAY_EXPORT_TIMEOUT_S"] = "120"
+        self.assertEqual(boot._play_export_timeout_s(), 120)
+
+    def test_zero_falls_back_not_disables(self):
+        os.environ["RL_PLAY_EXPORT_TIMEOUT_S"] = "0"
+        self.assertEqual(boot._play_export_timeout_s(), boot.DEFAULT_PLAY_EXPORT_TIMEOUT_S)
+
+    def test_bad_value_falls_back_to_default(self):
+        os.environ["RL_PLAY_EXPORT_TIMEOUT_S"] = "not-a-number"
+        self.assertEqual(boot._play_export_timeout_s(), boot.DEFAULT_PLAY_EXPORT_TIMEOUT_S)
+
+
 class HasCheckpointTest(unittest.TestCase):
     def test_false_then_true_when_model_pt_appears(self):
         with tempfile.TemporaryDirectory() as d:

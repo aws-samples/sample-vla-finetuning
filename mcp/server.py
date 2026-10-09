@@ -159,6 +159,16 @@ def submit_finetune(
     actually submit (incurs GPU cost). For GR00T UNITREE_G1, the platform auto-sets
     action_horizon=50 (the full-body embodiment needs it — omitting it ships the 40/50
     mismatch); pass action_horizon explicitly to override for other embodiments.
+
+    PLACEABILITY: the dry_run plan also returns `placeable`. The deployed Pattern A Batch
+    Compute Environment is SINGLE-GPU (g6e.4xlarge) and Batch has no per-job instance-type
+    override, so a Pattern A plan asking for >1 GPU (e.g. via instance_type=ml.g6e.12xlarge,
+    which resolves to 4 GPUs) is `placeable=False` + `runnable=False`: it would sit in
+    RUNNABLE forever (MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT) if submitted. The plan_text
+    carries a NOT PLACEABLE banner with the reason. Fix before dry_run=False: num_gpus=1 (one
+    L40S fits pi05 expert-only / LoRA / full-VLM), backend='sagemaker' (Pattern B provisions
+    its own multi-GPU instance), or num_nodes>1 (Pattern C FSDP shards across nodes). A true
+    single-node multi-GPU Batch run needs the Pattern A CE redeployed with a multi-GPU type.
     """
     event = {
         "intent": intent,
@@ -220,6 +230,22 @@ def submit_finetune(
         # in the dry_run plan lets the consumer choose the backend before submitting, instead
         # of discovering the handoff only after a dry_run=False attempt.
         mcp_can_submit = plan_out.get("mcp_can_submit", plan_out["pattern"] == "A")
+        # placeable=False means the plan can't be placed on the DEPLOYED Compute Environment
+        # (e.g. num_gpus>1 on the single-GPU Batch CE) — re-calling with dry_run=False would
+        # NOT launch it (submit returns recommend_only), so the note steers a fix instead of a
+        # submit. The plan_text already carries a "NOT PLACEABLE" banner with the reason.
+        placeable = plan_out.get("placeable", True)
+        if not placeable:
+            note = ("dry_run=True — nothing launched. NOT PLACEABLE on the deployed "
+                    "infrastructure (see plan_text): re-calling with dry_run=False will NOT "
+                    "submit (returns recommend_only). Fix the plan (commonly num_gpus=1, or "
+                    "backend='sagemaker', or num_nodes>1) and dry_run again.")
+        else:
+            note = ("dry_run=True — nothing launched. Re-call with dry_run=False to submit "
+                    "(GPU cost). GR00T G1: pass action_horizon=50."
+                    + ("" if mcp_can_submit else
+                       " NOTE: mcp_can_submit=false — this backend returns a launch.py handoff, "
+                       "not an MCP-launched job. For MCP-only launch, pass backend='batch'."))
         return {
             "submitted": False,
             "dry_run": True,
@@ -227,14 +253,11 @@ def submit_finetune(
             "pattern": plan_out["pattern"],
             "backend": plan_out["backend"],
             "runnable": plan_out["runnable"],
+            "placeable": placeable,
             "mcp_can_submit": mcp_can_submit,
             "plan_text": plan_out["plan_text"],
             "decision": plan_out["decision"],
-            "note": "dry_run=True — nothing launched. Re-call with dry_run=False to submit "
-                    "(GPU cost). GR00T G1: pass action_horizon=50."
-                    + ("" if mcp_can_submit else
-                       " NOTE: mcp_can_submit=false — this backend returns a launch.py handoff, "
-                       "not an MCP-launched job. For MCP-only launch, pass backend='batch'."),
+            "note": note,
         }
 
     result = aws.submit_intent(event, region=region)
@@ -452,7 +475,11 @@ def register_checkpoint(
     bucket, _ = aws._split_s3(artifacts)  # noqa: SLF001 — internal helper, same package
     registry_uri = f"s3://{bucket}"
 
-    manifest = aws.get_json(sess, registry_uri, reg.REGISTRY_KEY) or reg.empty_manifest()
+    # Read the manifest via the single-arg s3:// URI form. The 2-arg form (bucket, key)
+    # treats arg1 as a LITERAL bucket and does not strip 's3://', so passing registry_uri
+    # there sent Bucket='s3://<bucket>' → get_object raises → None → silently reset manifest
+    # (every register overwrote it with just the latest entry).
+    manifest = aws.get_json(sess, f"{registry_uri}/{reg.REGISTRY_KEY}") or reg.empty_manifest()
     entry = reg.CheckpointEntry(
         id=facts["job_name"],
         output_s3=output_s3,
@@ -500,7 +527,9 @@ def list_checkpoints(
     if not bucket:
         return {"error": "could not resolve the artifacts bucket from IL Pattern A outputs."}
     registry_uri = f"s3://{bucket}"
-    manifest = aws.get_json(sess, registry_uri, reg.REGISTRY_KEY) or reg.empty_manifest()
+    # Single-arg s3:// URI form (see register_checkpoint): the 2-arg form left Bucket with
+    # the 's3://' prefix → get_object raised → empty list on every call.
+    manifest = aws.get_json(sess, f"{registry_uri}/{reg.REGISTRY_KEY}") or reg.empty_manifest()
     rows = reg.query(manifest, engine=engine, model=model, intent=intent,
                      consistency=consistency)
     return {"registry": f"{registry_uri}/{reg.REGISTRY_KEY}", "count": len(rows),

@@ -78,6 +78,18 @@ and picks the engine + backend:
   handoff an operator must run, so a consumer restricted to MCP cannot complete it. To force
   an MCP-launchable path, pass `backend='batch'` (routes to Pattern A). The dry_run `note`
   and `plan_text` say this explicitly so the backend can be chosen *before* submitting.
+- **Will Batch actually place this job? → check `placeable` in the dry_run plan.** The
+  deployed Pattern A Compute Environment is **single-GPU** (g6e.4xlarge) and Batch has no
+  per-job instance override, so a Pattern A plan asking for **>1 GPU** (e.g. via
+  `instance_type=ml.g6e.12xlarge`, which resolves to 4 GPUs) is `placeable:false` +
+  `runnable:false`: submitting it would leave the job in **RUNNABLE forever**
+  (`MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT`). The `plan_text` carries a `NOT PLACEABLE`
+  banner with the reason. Fix at the (free, creds-less) dry_run before `dry_run=False`:
+  `num_gpus=1` (one L40S fits pi05 expert-only / LoRA / full-VLM), `backend='sagemaker'`
+  (Pattern B provisions its own multi-GPU instance), or `num_nodes>1` (Pattern C FSDP shards
+  across nodes). A genuine single-node multi-GPU Batch run needs the Pattern A CE redeployed
+  with a multi-GPU `instanceTypes`. This closes the 2026-06-28 friction where a 4-GPU submit
+  reported `runnable:true` and only surfaced the misconfiguration after launch.
 
 ## Layout
 

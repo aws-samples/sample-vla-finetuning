@@ -137,7 +137,11 @@ def submit_intent(event: dict, *, region: str | None = None,
     sess = session(region)
     plan_out = orchestrator_plan.plan(event)
     if not plan_out.get("runnable"):
-        # Pattern C (recommend-only) — return the plan, do not attempt to submit.
+        # Not runnable on the deployed infra — return the plan, do NOT attempt to submit.
+        # Two cases: Pattern C (deploy-gated, operator-run sbatch — no auto-submit), and a
+        # Pattern A/B plan that is UNPLACEABLE on the deployed CE (e.g. num_gpus>1 on the
+        # single-GPU Batch CE → would sit in RUNNABLE forever). The plan_text carries the
+        # reason (a "NOT PLACEABLE" banner when placeable=False); status stays a no-launch.
         return {"status": "recommend_only", **plan_out}
 
     wiring = resolve_wiring(

@@ -217,6 +217,8 @@ def _submit_rl_batch(session, region: str, submit: dict) -> dict:
         env["RL_SEED"] = str(submit["seed"])
     if submit.get("skip_export"):
         env["RL_SKIP_EXPORT"] = "true"
+    if submit.get("liveness_deadline_s") is not None:
+        env["RL_LIVENESS_DEADLINE_S"] = str(submit["liveness_deadline_s"])
     if submit.get("overrides"):
         env["RL_EXTRA_OVERRIDES"] = " ".join(submit["overrides"])
 

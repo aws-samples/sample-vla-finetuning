@@ -283,6 +283,74 @@ check(len(q_ok) == 1 and q_ok[0]["id"] == "vla-ft-pi05-A", "query by consistency
 check(rg.query(m)[0]["id"] == "gr00t-G1", "newest-first by registered_at")
 
 
+# ── get_json call convention (regression: registry read must strip 's3://') ──────────
+# The latent bug: register_checkpoint/list_checkpoints called get_json(sess, registry_uri,
+# REGISTRY_KEY) with registry_uri='s3://<bucket>'. The 2-arg form treats arg1 as a LITERAL
+# bucket (no scheme strip) → get_object(Bucket='s3://<bucket>') raises → None → empty
+# manifest. Result: every register overwrote the manifest with just the latest entry and
+# list always returned []. Fix = pass the single-arg s3:// URI so _split_s3 strips the
+# scheme. This test locks the Bucket/Key that reaches get_object for each call form.
+print("get_json call convention:")
+import json as _json
+
+
+class _FakeS3:
+    """Records get_object args and returns a canned JSON body keyed by (bucket, key).
+    Raises NoSuchBucket-style error if the exact (bucket, key) wasn't stored — which is
+    exactly what S3 does when Bucket carries a stray 's3://' prefix."""
+    def __init__(self, store):
+        self._store = store          # {(bucket, key): dict}
+        self.calls = []
+
+    def get_object(self, Bucket=None, Key=None):
+        self.calls.append((Bucket, Key))
+        if (Bucket, Key) not in self._store:
+            raise RuntimeError(f"NoSuchKey Bucket={Bucket!r} Key={Key!r}")
+        body = _json.dumps(self._store[(Bucket, Key)]).encode("utf-8")
+        return {"Body": _FakeBody(body)}
+
+
+class _FakeBody:
+    def __init__(self, b):
+        self._b = b
+
+    def read(self):
+        return self._b
+
+
+class _FakeS3Session:
+    def __init__(self, s3):
+        self._s3 = s3
+
+    def client(self, name):
+        assert name == "s3"
+        return self._s3
+
+
+MANIFEST = {"version": 1, "checkpoints": [{"id": "vla-ft-pi05-A"}]}
+# The registry lives at Bucket='artifacts-bucket', Key='registry/checkpoints.json'.
+_store = {("artifacts-bucket", "registry/checkpoints.json"): MANIFEST}
+
+# (fixed) single-arg s3:// URI form → scheme stripped → correct Bucket/Key → manifest read.
+s3a = _FakeS3(_store)
+got = aws.get_json(_FakeS3Session(s3a), "s3://artifacts-bucket/registry/checkpoints.json")
+check(got == MANIFEST, "single-arg s3:// URI reads the manifest (scheme stripped)")
+check(s3a.calls == [("artifacts-bucket", "registry/checkpoints.json")],
+      "get_object called with clean Bucket='artifacts-bucket' (no 's3://')")
+
+# (old bug) 2-arg literal-bucket form with an s3:// value → Bucket keeps 's3://' → miss → None.
+s3b = _FakeS3(_store)
+bad = aws.get_json(_FakeS3Session(s3b), "s3://artifacts-bucket", "registry/checkpoints.json")
+check(bad is None, "2-arg form with 's3://<bucket>' misses (documents the pre-fix failure)")
+check(s3b.calls == [("s3://artifacts-bucket", "registry/checkpoints.json")],
+      "2-arg form passes Bucket verbatim with the stray 's3://' (why reads returned None)")
+
+# 2-arg form with a BARE bucket (the intended literal use) still works.
+s3c = _FakeS3(_store)
+ok2 = aws.get_json(_FakeS3Session(s3c), "artifacts-bucket", "registry/checkpoints.json")
+check(ok2 == MANIFEST, "2-arg form with a bare bucket name still reads correctly")
+
+
 # ── ECR image-digest resolver (P2 diagnosis: did ':latest' drift under a run?) ────────
 print("image-digest resolver:")
 

@@ -91,6 +91,21 @@ MAX_SINGLE_GPU_MEM_GB = 48
 # so the safe answer when a replica exceeds this floor is to route to On-Demand.
 SPOT_GPU_FLOOR_GB = 24
 
+# The DEPLOYED Pattern A Batch Compute Environments (lib/{il,rl,il/gr00t}-pattern-a-stack.ts)
+# are SINGLE-GPU by default: g6e.4xlarge (1×L40S) primary, g5.4xlarge (1×A10G) Spot fallback,
+# maxvCpus=16 (one instance at a time). Batch has NO per-job instance-type override — the CE
+# decides the instance — so a plan asking for >1 GPU on Pattern A is UNPLACEABLE on the
+# deployed CE: the job sits in RUNNABLE forever (MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT),
+# the exact 2026-06-28 friction (a 4-GPU pi05 submit that never started). A genuine multi-GPU
+# Pattern A run needs REDEPLOYING the CE with a multi-GPU instance type (the stacks accept an
+# instanceTypes override) — which this PURE planner cannot detect without a live
+# describe-compute-environments call, and the dry_run plan is creds-free by design
+# (orchestrator_plan.py header). So we model the DEFAULT deployed CE here and flag the
+# un-placeable ask at the cheap (no-cost, no-creds) dry_run gate, instead of reporting
+# runnable:true and discovering the permanent-RUNNABLE only after a cost-incurring submit.
+# (Pattern B / SageMaker provisions its own multi-GPU instance, so this ceiling is A-only.)
+PATTERN_A_CE_MAX_GPUS = 1
+
 # Spot discount factor for the estimate. Anchored to the REAL Pattern A run
 # (g6e.4xl Spot, 2026-06-15: ~$0.20 for ~12.7 min RUNNING ⇒ ~$0.94/hr ⇒ ~31 % of
 # the $3.004 OD). Spot fluctuates (~30–60 % of OD typically); we use ~0.35 and
@@ -179,6 +194,14 @@ class Decision:
     est_cost_od_usd: float   # same wall-clock at On-Demand (for comparison)
     rationale: str
     axis: str = "il"         # "il" | "rl" — which axis (and which pattern stack) this targets
+    # Placeability on the DEPLOYED backend (vs `runnable`, which means the pattern *exists*).
+    # A Pattern A plan asking for more GPUs than the deployed single-GPU CE can provide is
+    # runnable-as-a-pattern but UNplaceable on the live CE → it would sit in RUNNABLE forever.
+    # The orchestrator folds this into the dry_run `runnable` gate so the un-placeable ask is
+    # caught for free (no creds, no cost) instead of after a submit. True for every plan that
+    # the deployed infra can actually start.
+    placeable: bool = True
+    placement_note: str = ""  # why not placeable (empty when placeable)
     notes: list[str] = field(default_factory=list)
 
 
@@ -226,6 +249,28 @@ def _price(instance: Instance, pattern: str, spot: bool) -> float:
     Spot applies SPOT_FACTOR (A's Batch CE is always Spot; B uses Managed Spot)."""
     base = instance.sm_od if (pattern == "B" and instance.sm_od) else instance.ec2_od
     return round(base * (SPOT_FACTOR if spot else 1.0), 4)
+
+
+def pattern_a_placement(pattern: str, num_gpus: int) -> tuple[bool, str]:
+    """Can the DEPLOYED Pattern A Batch CE actually place a plan asking for `num_gpus`?
+
+    Pure (no creds): models the DEFAULT deployed single-GPU CE (see PATTERN_A_CE_MAX_GPUS).
+    Pattern B (SageMaker) and C (HyperPod) provision their own instances, so only Pattern A
+    is bounded by the deployed CE. Returns (placeable, note); note is the dry_run-gate reason
+    when un-placeable (empty otherwise). This is what turns the 2026-06-28 permanent-RUNNABLE
+    friction into a free, creds-less dry_run verdict instead of a post-submit discovery."""
+    if pattern == "A" and num_gpus > PATTERN_A_CE_MAX_GPUS:
+        return False, (
+            f"Pattern A asks for {num_gpus} GPUs, but the deployed Batch Compute Environment "
+            f"provides {PATTERN_A_CE_MAX_GPUS} GPU per instance (g6e.4xlarge) and Batch has no "
+            f"per-job instance-type override — the job would sit in RUNNABLE forever "
+            f"(MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT). Fix: num_gpus=1 (one L40S fits pi05 "
+            f"expert-only / LoRA / full-VLM), or Pattern B (SageMaker provisions a multi-GPU "
+            f"instance itself), or num_nodes>1 (Pattern C FSDP shards across nodes). A genuine "
+            f"single-node multi-GPU Batch run needs the Pattern A CE REDEPLOYED with a "
+            f"multi-GPU instanceTypes (e.g. g6e.12xlarge); this planner assumes the default "
+            f"single-GPU deployment.")
+    return True, ""
 
 
 def decide(
@@ -287,6 +332,15 @@ def decide(
             notes.append(f"instance {instance_override!r} not in the catalog — "
                          f"cost estimate may be unavailable.")
         instance_type = bare
+        # Pattern A reads its instance from the deployed Batch CE — batch_launch.py takes no
+        # --instance-type — so an instance_override on Pattern A only changes the displayed
+        # cost estimate, NOT where the job runs (it lands on the CE's g6e.4xlarge). Say so,
+        # rather than silently presenting the overridden type as the run's instance.
+        if pattern == "A":
+            notes.append(f"instance_type {instance_override!r} only changes the cost estimate "
+                         f"on Pattern A — Batch picks the instance from the Compute Environment "
+                         f"(g6e.4xlarge), not per job. To actually run on {bare}, redeploy the "
+                         f"Pattern A CE with that instanceTypes or use Pattern B (SageMaker).")
     elif pattern == "A":
         instance_type = "g6e.4xlarge"   # CE primary (falls back to g5.4xlarge on capacity)
         notes.append("Pattern A instance is set by the Batch Compute Environment "
@@ -309,6 +363,21 @@ def decide(
     num_gpus = instance.gpus if instance else 1
     per_device_batch = max(1, round(EFF_BATCH / num_gpus))
     sm_instance_type = f"ml.{instance_type}" if pattern == "B" else ""
+
+    # ── deployed-CE placement check (Pattern A only) ──
+    # A Pattern A plan resolving to >1 GPU (e.g. instance_override=ml.g6e.12xlarge → 4 GPU)
+    # can't be placed on the deployed single-GPU CE — Batch has no per-job instance override,
+    # so the job would sit in RUNNABLE forever. Flag it for the dry_run gate (the orchestrator
+    # folds placeable into `runnable`). For pi-family full-VLM specifically, one L40S is enough
+    # (39.6 GB ≤ 48), so steer the user to num_gpus=1 rather than just rejecting.
+    placeable, placement_note = pattern_a_placement(pattern, num_gpus)
+    if not placeable:
+        notes.append(placement_note)
+        if profile.params_b <= 3.5 and profile.ft_mode in ("full_ft", "expert_only", "lora"):
+            notes.append(f"For {profile.model} ({profile.params_b:g}B), one L40S (48 GB) fits "
+                         f"the ~{vram:.0f} GB replica — num_gpus=1 on Pattern A runs as-is "
+                         f"(more GPUs under DDP would only replicate the optimizer state, not "
+                         f"reduce per-GPU memory).")
 
     # ── GPU-floor guard (Pattern A only): keep a too-big replica off the 24 GB g5 ──
     # Batch picks the instance from the CE list (no per-job override), so a Spot job whose
@@ -356,6 +425,8 @@ def decide(
         est_cost_usd=est_cost,
         est_cost_od_usd=est_cost_od,
         rationale=rationale,
+        placeable=placeable,
+        placement_note=placement_note,
         notes=notes,
     )
 
@@ -541,6 +612,13 @@ def decide_rl(
     instance = INSTANCES.get(instance_type)
     num_gpus = profile.num_gpus if profile.num_gpus > 1 else (instance.gpus if instance else 1)
 
+    # ── deployed-CE placement check (Pattern A only) ── num_gpus>1 needs the RlPatternAStack
+    # CE redeployed with a multi-GPU instanceType; on the default single-GPU deploy a >1-GPU
+    # ask sits in RUNNABLE forever. Flag it for the dry_run gate (same bug class as IL).
+    placeable, placement_note = pattern_a_placement(pattern, num_gpus)
+    if not placeable:
+        notes.append(placement_note)
+
     # ── cost estimate (UNVERIFIED for RL — see RL_S_PER_ITER) ──
     wall = profile.est_wall_clock_h
     if instance and wall is not None:
@@ -582,6 +660,8 @@ def decide_rl(
         est_cost_od_usd=est_cost_od,
         rationale=rationale,
         axis="rl",
+        placeable=placeable,
+        placement_note=placement_note,
         notes=notes,
     )
 
@@ -697,9 +777,12 @@ def decide_groot(
         notes.append(f"GR00T's deployed CE is {GROOT_INSTANCE} (1×L40S, NO g5/A10G fallback "
                      f"— 24 GB OOMs a 3B Cosmos model); {instance_type!r} only changes the "
                      f"cost estimate, not where the job actually runs.")
-    if profile.num_gpus > 1:
-        notes.append(f"{profile.num_gpus}-GPU GR00T needs a multi-GPU CE (e.g. g6e.12xlarge); "
-                     f"the default GrootPatternAStack is single-GPU g6e.4xlarge.")
+    # ── deployed-CE placement check ── GR00T is always Pattern A on the single-GPU
+    # GrootPatternAStack; num_gpus>1 needs that CE redeployed with a multi-GPU instanceType,
+    # else the job sits in RUNNABLE forever. Flag it for the dry_run gate (same bug class as IL).
+    placeable, placement_note = pattern_a_placement("A", profile.num_gpus)
+    if not placeable:
+        notes.append(placement_note)
     if profile.action_horizon == GROOT_G1_ACTION_HORIZON:
         notes.append("action_horizon=50 (UNITREE_G1 full-body) set via the baked "
                      "g1_finetune.py wrapper before model build — avoids the 40/50 step-0 crash.")
@@ -739,6 +822,8 @@ def decide_groot(
         rationale=(f"GR00T N1.7 fine-tune → Pattern A (Batch, GrootPatternAStack) on "
                    f"{instance_type} (1×L40S); the only deployed GR00T backend"),
         axis="gr00t",
+        placeable=placeable,
+        placement_note=placement_note,
         notes=notes,
     )
 

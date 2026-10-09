@@ -425,7 +425,7 @@ def build_command(hp):
         cmd.append(f"--save_freq={hp['save_freq']}")
     if str(hp.get("gradient_checkpointing", "")).lower() == "true" and pi_family:
         cmd.append("--policy.gradient_checkpointing=true")
-    if "freeze_vision_encoder" in hp:
+    if "freeze_vision_encoder" in hp and pi_family:
         cmd.append(f"--policy.freeze_vision_encoder={hp['freeze_vision_encoder']}")
     if str(hp.get("train_expert_only", "")).lower() == "true":
         cmd.append("--policy.train_expert_only=true")

@@ -13,13 +13,11 @@ RL_* contract (env, set by Batch container overrides at SubmitJob; flags documen
 rl_launch.py): RL_TASK, RL_OUTPUT_S3, RL_EXPERIMENT_NAME, RL_CHECKPOINT_DIR (EFS; logs/
 symlinked here → resume), RL_NUM_ENVS, RL_MAX_ITERATIONS, RL_SEED, RL_NUM_GPUS (>1 →
 torchrun --distributed), RL_PLAY_ENVS, RL_EXTRA_OVERRIDES (Hydra), RL_ISAACLAB_DIR,
-RL_SKIP_EXPORT, RL_LIVENESS_DEADLINE_S (guard grace seconds; default 1200; 0=off).
+RL_SKIP_EXPORT, RL_LIVENESS_DEADLINE_S (guard grace seconds; default 1200; 0=off),
+RL_PLAY_EXPORT_TIMEOUT_S (export cap; default 300; play.py loops forever after export).
 
-Liveness guard (the 5.5 h idle run): the first real RL submit sat "RUNNING" 5.5 h with
-no checkpoints, stdout frozen at boot — the base ENTRYPOINT had swallowed this bootstrap
-(fixed with ENTRYPOINT []); Batch saw "RUNNING" and never killed it, ~$17 burned for
-zero training. Status != learning. The guard makes "booted but not learning" a fast
-non-zero exit with no human watching.
+Liveness guard: a booted-but-idle trainer (Status != learning) is a fast non-zero exit,
+not a silent multi-hour burn. (History of the 5.5 h idle-run that motivated it: git log.)
 """
 
 import os
@@ -51,6 +49,10 @@ LIVENESS_KILL_RC = 42
 # Guard grace period (s) + poll cadence. 20 min ≈ 4x a healthy boot, ~16x < the 5.5 h
 # burn; cleared the instant training starts so a fast boot is never penalized.
 DEFAULT_LIVENESS_DEADLINE_S = 1200
+
+# play.py export cap: play.py writes exported/ once then loops forever; we bound it and
+# gate success on the artifact, not the exit code. env-tunable (RL_PLAY_EXPORT_TIMEOUT_S).
+DEFAULT_PLAY_EXPORT_TIMEOUT_S = 300
 POLL_INTERVAL_S = 1.0
 
 
@@ -144,8 +146,8 @@ def _build_train_cmd(isaaclab_sh, num_gpus):
 
 
 def _build_play_cmd(isaaclab_sh, checkpoint):
-    """rsl_rl play.py — runs a short rollout and exports policy.pt + policy.onnx
-    into <checkpoint_dir>/exported/ (the only documented built-in ONNX export)."""
+    """rsl_rl play.py — exports policy.pt + policy.onnx into <checkpoint_dir>/exported/
+    (the only built-in ONNX export), then loops; the caller bounds it with a timeout."""
     task = os.environ.get("RL_TASK", "Isaac-Velocity-Rough-H1-v0")
     play_envs = os.environ.get("RL_PLAY_ENVS", "32")
     return [
@@ -176,6 +178,19 @@ def _liveness_deadline_s():
         print(f"[rl-bootstrap] WARNING: bad RL_LIVENESS_DEADLINE_S={raw!r}; using default "
               f"{DEFAULT_LIVENESS_DEADLINE_S}s", flush=True)
         return DEFAULT_LIVENESS_DEADLINE_S
+
+
+def _play_export_timeout_s():
+    """Bounded play.py export wall-clock (RL_PLAY_EXPORT_TIMEOUT_S; default 300).
+    0/bad falls back to the default — 0 must NOT disable (that reopens the hang)."""
+    raw = os.environ.get("RL_PLAY_EXPORT_TIMEOUT_S")
+    if raw is None or raw == "":
+        return DEFAULT_PLAY_EXPORT_TIMEOUT_S
+    try:
+        v = int(raw)
+        return v if v > 0 else DEFAULT_PLAY_EXPORT_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_PLAY_EXPORT_TIMEOUT_S
 
 
 def _run_train_with_liveness_guard(train_cmd, isaaclab_dir, experiment, deadline_s,
@@ -299,18 +314,23 @@ def main():
     checkpoint = _latest_checkpoint(run_dir)
     print(f"[rl-bootstrap] run dir: {run_dir}  checkpoint: {checkpoint}", flush=True)
 
-    # 4. Export policy.pt + policy.onnx via the rsl_rl play.py (best-effort: a failed
-    #    export must not discard the trained checkpoint we already have).
+    # 4. Export policy.pt + policy.onnx via play.py, under a timeout: play.py writes
+    #    exported/ once then loops forever, so the timeout-kill is expected and leaves
+    #    valid artifacts. start_new_session so the kill reaches the whole Kit tree.
     if checkpoint and os.environ.get("RL_SKIP_EXPORT", "false").lower() != "true":
         play_cmd = _build_play_cmd(isaaclab_sh, checkpoint)
-        print(f"[rl-bootstrap] export: {' '.join(play_cmd)}", flush=True)
-        prc = subprocess.run(play_cmd, cwd=isaaclab_dir).returncode
-        if prc not in GRACEFUL_RCS:
-            print(f"[rl-bootstrap] WARNING: ONNX export (play.py) rc={prc} — uploading checkpoints without exported/", flush=True)
-        else:
-            exported = os.path.join(os.path.dirname(checkpoint), "exported")
-            onnx = os.path.join(exported, "policy.onnx")
-            print(f"[rl-bootstrap] exported: {onnx} (exists={os.path.exists(onnx)})", flush=True)
+        timeout_s = _play_export_timeout_s()
+        onnx = os.path.join(os.path.dirname(checkpoint), "exported", "policy.onnx")
+        print(f"[rl-bootstrap] export ({timeout_s}s cap, timeout expected): "
+              f"{' '.join(play_cmd)}", flush=True)
+        try:
+            prc = subprocess.run(play_cmd, cwd=isaaclab_dir, timeout=timeout_s,
+                                 start_new_session=True).returncode
+            if prc not in GRACEFUL_RCS:
+                print(f"[rl-bootstrap] WARNING: play.py rc={prc}", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"[rl-bootstrap] export: play.py hit {timeout_s}s timeout (expected)", flush=True)
+        print(f"[rl-bootstrap] exported: {onnx} (exists={os.path.exists(onnx)})", flush=True)
 
     # 5. Upload the whole run dir (checkpoints + exported/) to S3.
     n = sync_up(s3, run_dir, output_s3)

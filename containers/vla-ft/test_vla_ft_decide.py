@@ -168,6 +168,8 @@ def _fake_args(**kw):
     base = dict(model="pi05", dataset="s3://b/ds/", pretrained_path=None, steps=20000,
                 select_best=False, val_episodes=None, save_freq=None,
                 early_stop_patience=None,
+                # Per-job wall clock (only emitted into argv when set).
+                timeout_hours=None,
                 # LoRA flags (only emitted into argv when args.lora is True).
                 lora=False, lora_r=None, lora_alpha=None, lora_target_modules=None,
                 # RL intent fields (only read by the RL path / build_rl_argv).
@@ -656,10 +658,68 @@ def test_multinode_pattern_c():
           "explicit --backend batch overrides the num_nodes→C inference (user wins)")
 
 
+def test_placement_gate():
+    """A Pattern A plan asking for more GPUs than the deployed single-GPU CE provides is
+    runnable-as-a-pattern but UNPLACEABLE on the live CE (Batch has no per-job instance
+    override) → it would sit in RUNNABLE forever. The planner flags placeable=False at the
+    free dry_run gate (the 2026-06-28 friction: a 4-GPU pi05 submit that never started),
+    folds it into `runnable`, and steers single-GPU/Pattern B/multi-node. Single-GPU plans
+    and Pattern B (SageMaker provisions its own instance) are untouched."""
+    print("deployed-CE placement gate (num_gpus > the single-GPU CE):")
+    import orchestrator_plan as op
+
+    # pure helper: A + >1 GPU → not placeable; A + 1 GPU and B/C any → placeable.
+    ok1, n1 = dec.pattern_a_placement("A", 4)
+    check(ok1 is False and "RUNNABLE forever" in n1, "helper: A + 4 GPU → not placeable, names RUNNABLE")
+    check(dec.pattern_a_placement("A", 1)[0] is True, "helper: A + 1 GPU → placeable")
+    check(dec.pattern_a_placement("B", 8)[0] is True, "helper: B (own instance) → placeable regardless of GPUs")
+
+    # REPRO of the exact friction: IL num_gpus=4 via instance_type, backend=batch.
+    repro = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "lora": True, "backend": "batch",
+                     "instance_type": "ml.g6e.12xlarge", "steps": 20000})
+    check(repro["pattern"] == "A" and repro["runnable"] is False and repro["placeable"] is False,
+          "REPRO: IL 4-GPU on Batch → Pattern A, NOT runnable (was the runnable:true lie)")
+    check(repro["mcp_can_submit"] is False and "NOT PLACEABLE" in repro["plan_text"],
+          "REPRO: mcp_can_submit False + NOT PLACEABLE banner in plan_text")
+
+    # P-B: instance_type on Pattern A only changes the estimate, not where it runs (no silent lie).
+    check(any("only changes the cost estimate" in n for n in repro["decision"]["notes"]),
+          "P-B: Pattern A instance_type flagged as cost-only (Batch picks the CE instance)")
+    # P-C: pi05 full-VLM steered to num_gpus=1 (one L40S fits; more GPUs only replicate state).
+    check(any("one L40S" in n and "num_gpus=1" in n for n in repro["decision"]["notes"]),
+          "P-C: steers pi05 to num_gpus=1 (one L40S fits the replica)")
+
+    # Controls: single-GPU stays runnable; Pattern B multi-GPU stays runnable.
+    a1 = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 200})
+    check(a1["pattern"] == "A" and a1["runnable"] and a1["placeable"],
+          "control: IL single-GPU Pattern A → runnable + placeable")
+    b = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "steps": 20000})
+    check(b["pattern"] == "B" and b["runnable"] and b["placeable"],
+          "control: Pattern B (SageMaker own instance) → runnable + placeable")
+
+    # RL + GR00T: num_gpus>1 on the default single-GPU CE → same not-placeable verdict.
+    rl = op.plan({"task": "Isaac-Velocity-Rough-H1-v0", "max_iterations": 3000, "num_gpus": 4})
+    check(rl["pattern"] == "A" and not rl["runnable"] and not rl["placeable"],
+          "RL: num_gpus=4 on the default single-GPU CE → NOT placeable")
+    check(op.plan({"task": "Isaac-Velocity-Rough-H1-v0", "max_iterations": 3000})["placeable"],
+          "RL: num_gpus=1 (default) → placeable (control)")
+    g = op.plan({"dataset": "s3://b/ds/", "embodiment_tag": "UNITREE_G1", "num_gpus": 2, "steps": 5000})
+    check(g["pattern"] == "A" and not g["runnable"] and not g["placeable"],
+          "GR00T: num_gpus=2 → NOT placeable")
+    check(op.plan({"dataset": "s3://b/ds/", "embodiment_tag": "UNITREE_G1", "steps": 5000})["placeable"],
+          "GR00T: num_gpus=1 (default) → placeable (control)")
+
+    # Pattern C (num_nodes>1) is not runnable for a DIFFERENT reason (operator-gated sbatch),
+    # and placeable stays True — the two gates are distinct (C's GPU count is the cluster's).
+    c = op.plan({"dataset": "s3://b/ds/", "model": "pi05", "num_nodes": 2, "steps": 20000})
+    check(c["pattern"] == "C" and not c["runnable"] and c["placeable"],
+          "Pattern C: not runnable (deploy-gated) but placeable True (distinct gate)")
+
+
 def main():
     for t in (test_rule_table, test_overrides, test_lora, test_cost_anchor, test_budget,
               test_cli_argv, test_cli_rl_argv, test_orchestrator, test_per_job_controls,
-              test_gpu_floor_guard, test_groot, test_multinode_pattern_c):
+              test_gpu_floor_guard, test_groot, test_multinode_pattern_c, test_placement_gate):
         t()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

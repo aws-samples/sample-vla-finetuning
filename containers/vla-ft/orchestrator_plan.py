@@ -209,6 +209,12 @@ def _rl_plan(event: dict) -> dict:
         "instance_type": decision.instance_type,
         "image_uri": event.get("image_uri"),  # advisory on Batch (see _il_plan / _envelope)
         "skip_export": bool(event.get("skip_export", False)),
+        # Envs for the export/eval rollout after training (rl_launch --play-envs; default 32).
+        "play_envs": event.get("play_envs"),
+        # Liveness guard grace seconds (RL_LIVENESS_DEADLINE_S; None → bootstrap default 1200).
+        # Wired like GR00T's liveness_deadline_s so orchestrated/MCP RL runs can tune the guard
+        # instead of being pinned to the 1200 s default (a heavy task can boot slower than that).
+        "liveness_deadline_s": event.get("liveness_deadline_s"),
         "overrides": event.get("overrides") or [],
         # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
         "timeout_s": _resolve_timeout_s(event),
@@ -267,11 +273,22 @@ def _envelope(axis: str, profile, decision, submit: dict, plan_text: str) -> dic
         plan_text = (f"{plan_text}\n  MCP submit : NO — Pattern B (SageMaker) requires an operator to run "
                      f"the launch.py handoff command (submit returns submitted:false). For an MCP-only "
                      f"workflow, pass backend='batch' to route to Pattern A (auto-submit).")
+    # Deployed-CE placement gate. A Pattern A plan asking for more GPUs than the deployed
+    # single-GPU CE can provide is runnable-as-a-pattern but UNPLACEABLE on the live CE — it
+    # would sit in RUNNABLE forever (MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT). Fold it into
+    # the deterministic `runnable` gate so the dry_run catches it for free (no creds, no cost)
+    # instead of after a submit; surface the reason in plan_text + as a NOT-PLACEABLE banner.
+    placeable = getattr(decision, "placeable", True)
+    if not placeable:
+        mcp_can_submit = False
+        plan_text = (f"{plan_text}\n  NOT PLACEABLE: {decision.placement_note}")
+    runnable = decision.pattern in ("A", "B") and placeable
     return {
         "axis": axis,
         "pattern": decision.pattern,
         "backend": decision.backend,
-        "runnable": decision.pattern in ("A", "B"),
+        "runnable": runnable,
+        "placeable": placeable,
         "mcp_can_submit": mcp_can_submit,
         "profile": dataclasses.asdict(profile),
         "decision": dataclasses.asdict(decision),
