@@ -24,6 +24,10 @@ updates:
     groups:
       pip-all:
         patterns: ["*"]
+    ignore:
+      # server.py is written against mcp 1.x (FastMCP); 2.x needs a code migration.
+      - dependency-name: mcp
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

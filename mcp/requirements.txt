@@ -2,5 +2,6 @@
 #   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 # The server also imports the verified core from ../containers/vla-ft/ (added to sys.path
 # by vla_aws.py) — no packaging needed, single source of truth.
-mcp>=1.2
+# mcp 2.x renamed FastMCP (server.py uses mcp.server.fastmcp) — stay on 1.x until migrated.
+mcp>=1.2,<2
 boto3>=1.34
