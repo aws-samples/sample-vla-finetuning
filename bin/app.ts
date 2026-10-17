@@ -53,6 +53,13 @@ const rlInstanceTypesList = (rlInstanceTypesCtx ?? '')
   .map((t) => t.trim())
   .filter((t) => t.length > 0);
 const rlInstanceTypes = rlInstanceTypesList.length > 0 ? rlInstanceTypesList : undefined;
+// RL Pattern A CE vCPU ceiling (stack default 16 = one g6e.4xlarge), e.g.
+// `-c rlMaxvCpus=48` to admit a 4-GPU g6e.12xlarge for a multi-GPU VLA RLVR run.
+const rlMaxvCpusCtx = app.node.tryGetContext('rlMaxvCpus') as string | undefined;
+const rlMaxvCpus = rlMaxvCpusCtx ? Number(rlMaxvCpusCtx) : undefined;
+if (rlMaxvCpus !== undefined && !(Number.isInteger(rlMaxvCpus) && rlMaxvCpus > 0)) {
+  throw new Error(`-c rlMaxvCpus must be a positive integer, got ${rlMaxvCpusCtx}`);
+}
 
 // IL Pattern A capacity is per-JOB, not per-deploy: PatternAStack always deploys BOTH a
 // Spot and an On-Demand queue (idle CEs cost nothing), and the launcher picks one at
@@ -144,6 +151,7 @@ new RlPatternAStack(app, 'PaiTrainingPlatform-RL-PatternA', {
   notifyEmail,
   useSpot: rlUseSpot,
   instanceTypes: rlInstanceTypes,
+  maxvCpus: rlMaxvCpus,
   description:
     'PAI Training Platform — RL Pattern A (AWS Batch + g6e for the Isaac Lab headless-PPO container)',
 });
