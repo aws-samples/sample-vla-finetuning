@@ -6,12 +6,15 @@ pretrained flow-matching VLA (pi0 / pi0.5) in LIBERO, where the reward is task s
 The image is RLinf's own published image, pinned by digest in the CDK stack; RLinf
 mounts its code rather than baking it in, so this glue (1) clones RLinf at a pinned
 commit onto EFS, (2) downloads the SFT checkpoint from Hugging Face onto EFS (both
-cached across jobs), (3) runs train_embodied_agent.py with Hydra overrides, and
+cached across jobs), (3) runs train_embodied_agent.py (train) or
+evaluations/eval_embodied_agent.py (eval) with Hydra overrides, and
 (4) uploads the run's log dir to S3. Stdlib only; S3 upload uses boto3 when the
 interpreter has it, else installs it into the EFS cache.
 
 VRL_* contract (env, set at SubmitJob): VRL_MODE (inspect | eval | train),
-VRL_CONFIG (an examples/embodiment/config name), VRL_MODEL_REPO (HF repo id),
+VRL_CONFIG (train: an examples/embodiment/config name; eval: an
+evaluations/<VRL_EVAL_BENCHMARK>/ config name, e.g. libero_spatial_openpi_pi05_eval),
+VRL_EVAL_BENCHMARK (default libero), VRL_MODEL_REPO (HF repo id),
 VRL_OUTPUT_S3, VRL_OVERRIDES (space-separated Hydra overrides), VRL_CACHE_DIR (EFS),
 VRL_RLINF_SHA, VRL_RLINF_ENV (the image's switch_env name), VRL_ROBOT_PLATFORM.
 
@@ -161,13 +164,17 @@ def train_or_eval(mode, cache, output_s3):
     log_dir = os.path.join(cache, "runs", run_name)
     os.makedirs(log_dir, exist_ok=True)
     embodied = os.path.join(repo, "examples", "embodiment")
-    overrides = [
-        f"runner.logger.log_path={log_dir}",
-        f"actor.model.model_path={model}",
-        f"rollout.model.model_path={model}",
-    ]
+    overrides = [f"runner.logger.log_path={log_dir}", f"rollout.model.model_path={model}"]
     if mode == "eval":
-        overrides.append("runner.only_eval=True")
+        # RLinf's eval configs put the full model preset on rollout.model and have no
+        # actor; the train configs' runner.only_eval=True path reads rollout.model.*
+        # (model_type, openpi, ...) that those configs only set on actor.model.
+        entry = os.path.join(repo, "evaluations", "eval_embodied_agent.py")
+        config_dir = os.path.join(repo, "evaluations", env("VRL_EVAL_BENCHMARK", "libero"))
+    else:
+        entry = os.path.join(embodied, "train_embodied_agent.py")
+        config_dir = os.path.join(embodied, "config")
+        overrides.append(f"actor.model.model_path={model}")
     overrides += shlex.split(env("VRL_OVERRIDES", ""))
     exports = (
         f"export EMBODIED_PATH={shlex.quote(embodied)} "
@@ -178,9 +185,9 @@ def train_or_eval(mode, cache, output_s3):
     train = " ".join(
         [
             "python",
-            shlex.quote(os.path.join(embodied, "train_embodied_agent.py")),
+            shlex.quote(entry),
             "--config-path",
-            shlex.quote(os.path.join(embodied, "config")),
+            shlex.quote(config_dir),
             "--config-name",
             shlex.quote(config),
         ]
