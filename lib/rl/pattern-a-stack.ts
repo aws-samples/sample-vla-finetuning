@@ -32,12 +32,12 @@
 import * as cdk from 'aws-cdk-lib';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as zlib from 'zlib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as batch from 'aws-cdk-lib/aws-batch';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import { Construct } from 'constructs';
+import { packPyBootstrap } from '../shared/py-bootstrap';
 import { SharedBaseStack } from '../shared/base-stack';
 import { TrainingNotifications } from '../shared/notifications';
 
@@ -195,19 +195,16 @@ export class RlPatternAStack extends cdk.Stack {
     // channel, which has a hard 8192-byte ceiling on the whole overrides blob. The raw
     // RL bootstrap is ~10.6 KB — over the limit (IL Pattern A's 5.7 KB bootstrap fit, so
     // the naive `python3 -c "<raw src>"` only failed for RL, and only at real submit).
-    // We therefore zlib-compress the source at synth (~5.3 KB) and inject a tiny
-    // decompress-and-run stub. zlib's DEFLATE stream is interoperable (Node deflate ->
-    // Python zlib.decompress, verified), and exec under a globals dict with
+    // We therefore drop full-line comments and zlib-compress the source at synth, then
+    // inject a ~6 KB decompress-and-run stub (lib/shared/py-bootstrap.ts). zlib's
+    // DEFLATE stream is interoperable (Node deflate -> Python zlib.decompress,
+    // verified), and exec under a globals dict with
     // __name__='__main__' fires the bootstrap's `if __name__ == "__main__": main()`.
     const bootstrapSrc = fs.readFileSync(
       path.join(__dirname, '..', '..', 'containers', 'isaac-lab-rl', 'rl_train_bootstrap.py'),
       'utf8',
     );
-    const packedBootstrap = zlib.deflateSync(Buffer.from(bootstrapSrc, 'utf8'), { level: 9 }).toString('base64');
-    const bootstrapStub =
-      'import base64,zlib;' +
-      `exec(compile(zlib.decompress(base64.b64decode("${packedBootstrap}")),"rl_train_bootstrap.py","exec"),` +
-      '{"__name__":"__main__"})';
+    const bootstrapStub = packPyBootstrap(bootstrapSrc, 'rl_train_bootstrap.py');
 
     const efsVolume = batch.EcsVolume.efs({
       name: 'shared-efs',

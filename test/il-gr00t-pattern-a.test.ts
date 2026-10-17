@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { SharedBaseStack } from '../lib/shared/base-stack';
 import { GrootPatternAStack } from '../lib/il/gr00t-pattern-a-stack';
+import { stripPyCommentLines } from '../lib/shared/py-bootstrap';
 
 const ENV = { account: '111111111111', region: 'us-west-2' };
 const GROOT_G1_ARN = 'arn:aws:s3:::example-gr00t-g1-dataset';
@@ -124,7 +125,7 @@ describe('GrootPatternAStack', () => {
       path.join(__dirname, '..', 'containers', 'gr00t-n17', 'gr00t_train_bootstrap.py'),
       'utf8',
     );
-    expect(restored).toBe(orig);
+    expect(restored).toBe(stripPyCommentLines(orig));
     expect(restored).toContain('GR00T N1.7 fine-tune - AWS Batch bootstrap (IL GR00T Pattern A)');
     expect(restored).toContain('GROOT_DATASET_S3');
   });

@@ -40,12 +40,12 @@
 import * as cdk from 'aws-cdk-lib';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as zlib from 'zlib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as batch from 'aws-cdk-lib/aws-batch';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import { Construct } from 'constructs';
+import { packPyBootstrap } from '../shared/py-bootstrap';
 import { SharedBaseStack } from '../shared/base-stack';
 import { TrainingNotifications } from '../shared/notifications';
 
@@ -203,11 +203,7 @@ export class GrootPatternAStack extends cdk.Stack {
       path.join(__dirname, '..', '..', 'containers', 'gr00t-n17', 'gr00t_train_bootstrap.py'),
       'utf8',
     );
-    const packedBootstrap = zlib.deflateSync(Buffer.from(bootstrapSrc, 'utf8'), { level: 9 }).toString('base64');
-    const bootstrapStub =
-      'import base64,zlib;' +
-      `exec(compile(zlib.decompress(base64.b64decode("${packedBootstrap}")),"gr00t_train_bootstrap.py","exec"),` +
-      '{"__name__":"__main__"})';
+    const bootstrapStub = packPyBootstrap(bootstrapSrc, 'gr00t_train_bootstrap.py');
 
     // --- /dev/shm sizing. The GR00T PyTorch DataLoader hands large multi-camera image
     // tensors (UNITREE_G1 ego_view 480x640x3, both arms) between worker processes via

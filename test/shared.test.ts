@@ -129,3 +129,51 @@ describe('AzSelectorConstruct', () => {
     });
   });
 });
+
+describe('packPyBootstrap', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const { execFileSync } = require('child_process');
+  const { stripPyCommentLines, packPyBootstrap } = require('../lib/shared/py-bootstrap');
+
+  const bootstraps = [
+    path.join(__dirname, '..', 'containers', 'isaac-lab-rl', 'rl_train_bootstrap.py'),
+    path.join(__dirname, '..', 'containers', 'gr00t-n17', 'gr00t_train_bootstrap.py'),
+  ];
+
+  // Comments never reach the AST, so an identical ast.dump proves the strip changed
+  // nothing the interpreter sees. A `#` line inside a multi-line string would change a
+  // string constant and fail this.
+  const AST_EQ =
+    'import ast,sys\n' +
+    'a,b=(open(p).read() for p in sys.argv[1:3])\n' +
+    'sys.exit(0 if ast.dump(ast.parse(a))==ast.dump(ast.parse(b)) else 1)\n';
+
+  test.each(bootstraps)('stripping comment lines keeps the AST of %s', (src: string) => {
+    const tmp = path.join(require('os').tmpdir(), `stripped-${path.basename(src)}`);
+    fs.writeFileSync(tmp, stripPyCommentLines(fs.readFileSync(src, 'utf8')));
+    expect(() => execFileSync('python3', ['-c', AST_EQ, src, tmp])).not.toThrow();
+  });
+
+  test('a comment-looking line inside a string literal changes the AST (the guard bites)', () => {
+    const src = 'X = """\n# not a comment\n"""\n';
+    const os = require('os');
+    const a = path.join(os.tmpdir(), 'guard-a.py');
+    const b = path.join(os.tmpdir(), 'guard-b.py');
+    fs.writeFileSync(a, src);
+    fs.writeFileSync(b, stripPyCommentLines(src));
+    expect(() => execFileSync('python3', ['-c', AST_EQ, a, b], { stdio: 'pipe' })).toThrow();
+  });
+
+  test('keeps a first-line shebang and drops indented comment lines', () => {
+    const out = stripPyCommentLines('#!/usr/bin/env python3\n# a\nx = 1  # inline kept\n    # b\ny = 2\n');
+    expect(out).toBe('#!/usr/bin/env python3\nx = 1  # inline kept\ny = 2\n');
+  });
+
+  test('the packed stub is smaller than packing the raw source', () => {
+    const zlib = require('zlib');
+    const raw = fs.readFileSync(bootstraps[0], 'utf8');
+    const rawPacked = zlib.deflateSync(Buffer.from(raw, 'utf8'), { level: 9 }).toString('base64');
+    expect(packPyBootstrap(raw, 'x.py').length).toBeLessThan(rawPacked.length);
+  });
+});

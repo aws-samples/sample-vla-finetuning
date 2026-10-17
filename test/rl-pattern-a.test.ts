@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { SharedBaseStack } from '../lib/shared/base-stack';
 import { RlPatternAStack } from '../lib/rl/pattern-a-stack';
+import { stripPyCommentLines } from '../lib/shared/py-bootstrap';
 
 const ENV = { account: '111111111111', region: 'us-west-2' };
 
@@ -98,7 +99,20 @@ describe('RlPatternAStack', () => {
     const def = Object.values(t.findResources('AWS::Batch::JobDefinition'))[0] as any;
     const cmd = def.Properties.ContainerProperties.Command as string[];
     const rr = def.Properties.ContainerProperties.ResourceRequirements as any[];
+    // ECS sees the JobDefinition defaults AND every key rl_launch.py can set, so the
+    // worst case is their union with realistic long values. The old list left out
+    // RL_PLAY_ENVS / RL_NUM_ENVS / RL_SEED / RL_EXTRA_OVERRIDES and the JD defaults: it
+    // passed at ~7.6k while a plain `--max-iterations 100 --num-envs 4096` submit was
+    // refused live with "Container Overrides length must be at most 8192".
+    const jdEnv = (def.Properties.ContainerProperties.Environment as Array<{ Name: string; Value: any }>)
+      .map((e) => ({ name: e.Name, value: typeof e.Value === 'string' ? e.Value : 's3://pai-artifacts-123456789012-us-west-2/isaac-rl' }));
     const worstEnv = [
+      ...jdEnv,
+      { name: 'RL_PLAY_ENVS', value: '32' },
+      { name: 'RL_NUM_ENVS', value: '4096' },
+      { name: 'RL_SEED', value: '42' },
+      { name: 'RL_SKIP_EXPORT', value: 'true' },
+      { name: 'RL_EXTRA_OVERRIDES', value: 'env.rewards.feet_air_time.weight=0.5 agent.algorithm.learning_rate=0.0003' },
       { name: 'RL_TASK', value: 'Isaac-Velocity-Rough-H1-v0' },
       { name: 'RL_EXPERIMENT_NAME', value: 'h1_rough' },
       { name: 'RL_OUTPUT_S3', value: 's3://pai-artifacts-123456789012-us-west-2/isaac-rl/isaac-rl-20260617-181938' },
@@ -109,7 +123,9 @@ describe('RlPatternAStack', () => {
       { name: 'RL_LIVENESS_DEADLINE_S', value: '1200' },
       { name: 'RL_HYDRA_OVERRIDES', value: 'env.scene.num_envs=4096 agent.max_iterations=3000' },
     ];
-    const merged = JSON.stringify({ command: cmd, environment: worstEnv, resourceRequirements: rr });
+    // ECS merges by name (override wins), so count each key once.
+    const env = [...new Map(worstEnv.map((e) => [e.name, e] as [string, typeof e])).values()];
+    const merged = JSON.stringify({ command: cmd, environment: env, resourceRequirements: rr });
     expect(Buffer.byteLength(merged, 'utf8')).toBeLessThan(8000);
   });
 
@@ -128,7 +144,9 @@ describe('RlPatternAStack', () => {
       path.join(__dirname, '..', 'containers', 'isaac-lab-rl', 'rl_train_bootstrap.py'),
       'utf8',
     );
-    expect(restored).toBe(orig);
+    // Full-line comments are dropped at synth (lib/shared/py-bootstrap.ts); everything
+    // else is byte-identical. AST equivalence is proven in test/shared.test.ts.
+    expect(restored).toBe(stripPyCommentLines(orig));
     // sanity: the restored source really is the RL bootstrap
     expect(restored).toContain('Isaac Lab RL — AWS Batch bootstrap (RL Pattern A)');
     expect(restored).toContain('RL_TASK');
