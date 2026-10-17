@@ -228,9 +228,12 @@ pai-training-platform/          (product: vla-ft)
   us-west-2 가격 기준)이 있는 단일 명령 smart-default launcher로 묶습니다.
   `test_vla_ft_decide.py`(98개 점검)와 live CloudFormation Outputs 대상 실제 dry-run이
   통과합니다; live `--yes` submit이 남은 점검 항목입니다.
-- **RL 경로: 최대 gap.** Isaac Lab headless PPO는 코드로 구현돼 synth + jest를
-  통과하지만, 아직 어떤 RL job도 GPU에서 실행되지 않았습니다. 실제 실행이 정책 + ONNX를
-  내놓기 전까지 RL coverage는 *구현됨, 아직 전달 안 됨*으로 간주하세요.
+- **RL 경로: end-to-end smoke 검증, 학습된 정책은 아직.** Isaac Lab headless-PPO
+  100 iteration smoke(`Isaac-Velocity-Rough-H1-v0`, 4096 env, 1×L40S g6e.4xlarge
+  On-Demand)가 Batch 에서 약 7.5분 만에 SUCCEEDED 로 끝났고, `exported/policy.onnx` +
+  `policy.pt` 와 checkpoint 를 S3 에 올렸습니다. 이것은 파이프라인(배포 → 제출 → 학습 →
+  ONNX export → 업로드)이 동작한다는 증거이지 정책 품질의 증거가 아닙니다 — 100 iteration
+  은 수렴에 한참 못 미칩니다. full-length reference run 이 RL 의 남은 점검 항목입니다.
 
 검증된 것 vs 설계만 된 것의 단계별 내역은 [`docs/ROADMAP.md`](docs/ROADMAP.md) 참고.
 
@@ -250,7 +253,7 @@ capability와 verified는 다르며, 컴포넌트별 전체 내역은 [상태](#
   Pattern B의 managed-spot resume은 코드 완성, 아직 배포 검증 안 됨 —
   [Spot 회수: 재시작이 아닌 재개](#spot-회수-재시작이-아닌-재개) 참고).
 - **Coverage** — IL *과* RL을 하나의 진입점 뒤에. *(IL Pattern A는 end-to-end 검증;
-  RL은 코드 완성, 아직 GPU 실행 안 됨 — 구현됨, 전달 안 됨.)*
+  RL은 GPU 에서 end-to-end smoke 검증 — 정책 + ONNX 산출; full-length run 은 대기.)*
 - **Backend 유연성** — 같은 intent를 Batch, SageMaker Training Job, HyperPod(A/B/C)에서
   실행, override 가능. *(A 검증; B 코드 완성, 배포 대기; C 코드 + `cdk synth`만.)*
 
@@ -274,9 +277,12 @@ capability와 verified는 다르며, 컴포넌트별 전체 내역은 [상태](#
 이 문서는 과장하지 않습니다. 동일한 caveat이
 [`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md)에도 기록돼 있습니다:
 
-- **RL은 구현됨, 아직 전달 안 됨.** Isaac Lab headless-PPO 경로는 synth + jest를
-  통과하지만, 이 계정에서 **아직 어떤 RL job도 GPU에서 실행되지 않았습니다.** 실제 실행이
-  정책 + ONNX를 내놓기 전까지 Coverage 주장은 *구현됨, 아직 전달 안 됨* 입니다.
+- **RL은 smoke 검증, 학습 검증은 아직.** 100 iteration Batch run 이 `policy.onnx` 를
+  내놓아 경로가 end-to-end 로 동작함을 보였지만, **full-length RL 학습 run 은 아직 없습니다**
+  — smoke 로 export 된 정책은 쓸 수 있는 보행 정책이 아닙니다. 첫 run 들에서 드러난 배포
+  문제 둘은 고쳤습니다: bootstrap 이 Batch 의 container override 8192 byte 한도 안에
+  들어가도록 줄였고, On-Demand `BEST_FIT_PROGRESSIVE` 가 용량이 없는 g5.4xlarge 만
+  계속 재시도할 때 `-c rlInstanceTypes=g6e.4xlarge` 로 instance 목록을 고정할 수 있습니다.
 - **단일 명령 경로는 dry-run 검증, `--yes` 검증은 아직.** Launcher·결정 모듈·비용 추정은
   `test_vla_ft_decide.py`와 실제 CloudFormation Outputs 대상 live dry-run을 통과하지만,
   live `--yes` submit이 남은 점검입니다. 비용 추정은 per-job profiler가 아니라 검증된

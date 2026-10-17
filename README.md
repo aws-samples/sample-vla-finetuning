@@ -233,9 +233,12 @@ pai-training-platform/          (product: vla-ft)
   launcher with pre-flight checks and a pre-launch cost estimate (real us-west-2 price
   anchors). `test_vla_ft_decide.py` (98 checks) and a real dry-run against live
   CloudFormation Outputs pass; a live `--yes` submit is the remaining check.
-- **RL path: the top gap.** Isaac Lab headless PPO is code-built and passes synth + jest,
-  but no RL job has yet run on a GPU. Until a real run produces a policy + ONNX, treat the
-  RL coverage as *built, not yet delivered*.
+- **RL path: smoke-verified end-to-end, not yet a trained policy.** A 100-iteration
+  Isaac Lab headless-PPO smoke (`Isaac-Velocity-Rough-H1-v0`, 4096 envs, 1×L40S
+  g6e.4xlarge On-Demand) ran under Batch and finished SUCCEEDED in ~7.5 min, writing
+  `exported/policy.onnx` + `policy.pt` and checkpoints to S3. That proves the pipeline
+  (deploy → submit → train → ONNX export → upload), not policy quality: 100 iterations is
+  far short of convergence. A full-length reference run is the remaining RL check.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase-by-phase breakdown of what is
 verified vs designed.
@@ -256,7 +259,7 @@ the full per-component breakdown:
   (Pattern A wires this and a real run finished SUCCEEDED; Pattern B's managed-spot resume
   is code-complete, not yet deploy-verified — see [Spot reclaim: resume, not restart](#spot-reclaim-resume-not-restart)).
 - **Coverage** — IL *and* RL behind one entry point. *(IL Pattern A verified end-to-end;
-  RL is code-complete but not yet run on a GPU — built, not delivered.)*
+  RL smoke-verified end-to-end on GPU — policy + ONNX out; a full-length run is pending.)*
 - **Backend flexibility** — the same intent runs on Batch, SageMaker Training Job, or
   HyperPod (A/B/C), with override. *(A verified; B code-complete, deploy pending; C code +
   `cdk synth` only.)*
@@ -281,9 +284,13 @@ does not (it is AWS-only and not a ParallelCluster replacement).
 This README does not oversell. The same caveats are tracked in
 [`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md):
 
-- **RL is built, not yet delivered.** The Isaac Lab headless-PPO path synthesizes and
-  passes jest, but **no RL job has run on a GPU** in this account. The Coverage claim is
-  *built, not delivered* until a real run produces a policy + ONNX.
+- **RL is smoke-verified, not training-verified.** A 100-iteration Batch run produced
+  `policy.onnx`, so the path works end to end, but **no full-length RL training run** has
+  been done yet — the exported smoke policy is not a usable locomotion policy. Two
+  deploy-time issues surfaced by the first runs are fixed: the bootstrap now fits Batch's
+  8192-byte container-override limit, and `-c rlInstanceTypes=g6e.4xlarge` pins the
+  instance list when On-Demand `BEST_FIT_PROGRESSIVE` keeps retrying an out-of-capacity
+  g5.4xlarge.
 - **The one-command path is dry-run-validated, not `--yes`-validated.** The launcher,
   decision module, and cost estimate pass `test_vla_ft_decide.py` and a live dry-run
   against real CloudFormation Outputs, but a live `--yes` submit is the remaining check.

@@ -19,7 +19,7 @@ wedge (Ease / Efficiency / Coverage / Backend-flexibility). Priority order:
 
 | # | Reframed step | Axis | Maps to phase | Cost |
 |---|---------------|------|---------------|------|
-| 1 | **RL realized** — absorb Isaac Lab Batch PPO + 1 reference task | Coverage | **Phase 3** ◐ code built, real run pending | real GPU |
+| 1 | **RL realized** — absorb Isaac Lab Batch PPO + 1 reference task | Coverage | **Phase 3** ◐ E2E smoke verified, full run pending | real GPU |
 | 2 | **Unified launcher + smart defaults** — auto instance/backend pick, Spot default, pre-flight, quickstart | Ease | **Phase 6** ✅ built | 0 |
 | 3 | **Pre-launch cost estimate + early-stop/expert-only defaulted** — turn built levers into default UX | Efficiency | **Phase 6** ✅ built | 0 |
 | 4 | **Pattern B real deploy + 1 FT** — A is real-E2E; B is code-complete | Proof | **Phase 2b** | real GPU |
@@ -28,8 +28,9 @@ wedge (Ease / Efficiency / Coverage / Backend-flexibility). Priority order:
 > Phase 6 (#2–3) shipped as `containers/vla-ft/vla_ft_cli.py` + `vla_ft_decide.py`
 > (dry-run validated against live AWS; live `--yes` submit validated on the
 > `vla-ft-pi05-20260616-014126` run).
-> #1 RL is now **code-complete** (`containers/isaac-lab-rl/` + `lib/rl/pattern-a-stack.ts`,
-> synth + jest green); the remaining real-GPU work is the first RL run + #4 Pattern B live FT.
+> #1 RL is **E2E smoke-verified** (`containers/isaac-lab-rl/` + `lib/rl/pattern-a-stack.ts`:
+> a 100-iteration Batch run exported `policy.onnx`, 2026-10-17); the remaining real-GPU
+> work is a full-length RL reference run + #4 Pattern B live FT.
 
 > Note: the deterministic **Step Functions orchestrator** (Phase 4) is an
 > **optional, scale-gated graduation layer**, not the headline — the backend-select
@@ -150,7 +151,7 @@ wedge (Ease / Efficiency / Coverage / Backend-flexibility). Priority order:
 a dataset goes in, a checkpoint comes out, for A/B/GR00T. **2b/2d code complete (cost 0);
 real runs pending.***
 
-## Phase 3 — RL axis  ◐ code built, real run pending
+## Phase 3 — RL axis  ◐ E2E smoke verified, full-length run pending
 
 - ☑ Absorb a verified Isaac Lab Batch headless-PPO infra template into `lib/rl` +
   `containers/isaac-lab-rl`. **Automate Batch CE/JQ/JD** — the exact CE/JQ/JD the source
@@ -170,13 +171,20 @@ real runs pending.***
   iteration/env knobs. `rl_train_bootstrap.py` (Batch glue, injected via `python3 -c`)
   wires `logs/` → EFS (Spot-reclaim resume), runs headless PPO, runs play.py for ONNX,
   uploads the run dir → S3.
-- ☐ **Real deploy + one real RL run** producing a policy + ONNX (the GPU gate). Treat the
-  first run as an E2E smoke (the commands are documented-verified but unexecuted under
-  Batch in this account). NGC pull credentials for `nvcr.io/nvidia/isaac-sim:4.5.0` may be
-  needed at image-build time.
+- ☑ **Real deploy + E2E smoke** (2026-10-17): `Isaac-Velocity-Rough-H1-v0`, 100
+  iterations, 4096 envs, 1×L40S g6e.4xlarge On-Demand → SUCCEEDED in ~7.5 min,
+  `exported/policy.onnx` + `policy.pt` + checkpoints uploaded to S3 (~108k env-steps/s).
+  The first attempts surfaced two deploy-time bugs, both fixed:
+  - the injected bootstrap exceeded Batch's **8192-byte container-override limit**
+    (`lib/shared/py-bootstrap.ts` now strips comments and the size gate sums the real
+    override payload; GR00T uses the same packer);
+  - On-Demand `BEST_FIT_PROGRESSIVE` retried an out-of-capacity **g5.4xlarge** in both VPC
+    AZs for ~50 min and never tried g6e — `-c rlInstanceTypes=g6e.4xlarge` pins the list.
+- ☐ **Full-length reference run** (e.g. ≥1500 iterations) with a reward curve that shows
+  convergence — the smoke proves the pipeline, not policy quality.
 
-*Cost: 0 to build (synth + jest green, py_compile clean); real GPU for the first run.
-Gate: a reward+task goes in, a trained policy + ONNX comes out. **Code complete; real
+*Cost: 0 to build; ~$1 per 100-iteration smoke on On-Demand g6e.4xlarge. Gate: a
+reward+task goes in, a trained policy + ONNX comes out. **Pipeline verified; full-length
 run pending.***
 
 ## Phase 4 — Deterministic orchestrator  ◐ code + synth built, real run deferred (scale-gated)

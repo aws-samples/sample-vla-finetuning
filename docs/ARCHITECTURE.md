@@ -273,10 +273,10 @@ reinvention; the prior-art survey preceded the build.
   surfaces the practical blocker).
 - The Batch single-pattern slice (Pattern A) **overlaps VAMS**; its value here is as one
   selectable backend behind the smart-default launcher, not as a standalone novelty.
-- The **RL axis is code-built but not yet run on GPU** — RL Pattern A (Batch CE/JQ/JD +
-  the Isaac Lab rsl_rl container + launcher) synthesizes and passes jest, but no RL job
-  has executed under Batch in this account. Until the first real run produces a policy +
-  ONNX, the Coverage claim is *built, not delivered*. (Note the genuine VAMS overlap: VAMS
+- The **RL axis is smoke-verified on GPU, not training-verified** — RL Pattern A (Batch
+  CE/JQ/JD + the Isaac Lab rsl_rl container + launcher) ran a 100-iteration H1 smoke under
+  Batch to SUCCEEDED and exported `policy.onnx`. That closes the "built, not delivered"
+  gap for the pipeline; a full-length reference training run is still pending. (Note the genuine VAMS overlap: VAMS
   also runs Isaac Lab RL on Batch — §6 — so RL's differentiation lives in the IL→RL
   chaining + auto-select wedge, not in Batch RL alone.)
 - The Step Functions orchestrator (the old single-wedge claim) is **optional and
