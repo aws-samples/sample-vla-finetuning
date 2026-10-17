@@ -43,6 +43,16 @@ const notifyEmail = app.node.tryGetContext('notifyEmail') as string | undefined;
 // RL Pattern A capacity: Spot by default; `-c rlUseSpot=false` deploys an On-Demand CE
 // for a reclaim-free run (first E2E smoke / short runs with no checkpoint to resume).
 const rlUseSpot = app.node.tryGetContext('rlUseSpot') !== 'false';
+// RL Pattern A instance list override (comma-separated, highest priority first), e.g.
+// `-c rlInstanceTypes=g6e.4xlarge` when one type hits InsufficientInstanceCapacity in the
+// VPC's AZs. On-Demand BEST_FIT_PROGRESSIVE keeps retrying the best-fit (cheapest) type
+// and may never move on to the next one while that type is out of capacity.
+const rlInstanceTypesCtx = app.node.tryGetContext('rlInstanceTypes') as string | undefined;
+const rlInstanceTypesList = (rlInstanceTypesCtx ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter((t) => t.length > 0);
+const rlInstanceTypes = rlInstanceTypesList.length > 0 ? rlInstanceTypesList : undefined;
 
 // IL Pattern A capacity is per-JOB, not per-deploy: PatternAStack always deploys BOTH a
 // Spot and an On-Demand queue (idle CEs cost nothing), and the launcher picks one at
@@ -133,6 +143,7 @@ new RlPatternAStack(app, 'PaiTrainingPlatform-RL-PatternA', {
   base,
   notifyEmail,
   useSpot: rlUseSpot,
+  instanceTypes: rlInstanceTypes,
   description:
     'PAI Training Platform — RL Pattern A (AWS Batch + g6e for the Isaac Lab headless-PPO container)',
 });
