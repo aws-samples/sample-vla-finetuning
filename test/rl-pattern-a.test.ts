@@ -1,4 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as zlib from 'zlib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { SharedBaseStack } from '../lib/shared/base-stack';
 import { RlPatternAStack } from '../lib/rl/pattern-a-stack';
@@ -15,6 +18,12 @@ describe('RlPatternAStack', () => {
     base,
   });
   const t = Template.fromStack(stack);
+  /** The job definition whose logical id starts with `prefix` (the stack has two). */
+  const jobDef = (prefix: string): any => {
+    const hits = Object.entries(t.findResources('AWS::Batch::JobDefinition')).filter(([id]) => id.startsWith(prefix));
+    expect(hits).toHaveLength(1);
+    return hits[0][1];
+  };
 
   test('creates a managed EC2 Batch compute environment on Spot (g6e→g5 single-GPU fallback)', () => {
     t.resourceCountIs('AWS::Batch::ComputeEnvironment', 1);
@@ -48,7 +57,7 @@ describe('RlPatternAStack', () => {
 
   test('creates a job queue and a GPU job definition (1 GPU)', () => {
     t.resourceCountIs('AWS::Batch::JobQueue', 1);
-    t.resourceCountIs('AWS::Batch::JobDefinition', 1);
+    t.resourceCountIs('AWS::Batch::JobDefinition', 2); // Isaac Lab PPO + VLA RLVR (RLinf)
     t.hasResourceProperties('AWS::Batch::JobDefinition', {
       ContainerProperties: Match.objectLike({
         ResourceRequirements: Match.arrayWith([
@@ -76,8 +85,7 @@ describe('RlPatternAStack', () => {
   });
 
   test('the job command injects rl_train_bootstrap zlib-compressed (python3 -c <stub>), not a baked entrypoint', () => {
-    const defs = t.findResources('AWS::Batch::JobDefinition');
-    const def = Object.values(defs)[0] as any;
+    const def = jobDef('IsaacRlJobDef');
     const cmd = def.Properties.ContainerProperties.Command as string[];
     expect(cmd[0]).toBe('python3');
     expect(cmd[1]).toBe('-c');
@@ -96,7 +104,7 @@ describe('RlPatternAStack', () => {
     // in isolation. (The GR00T sibling stack hit this for real: a 6986-byte command passed a
     // `cmd.length < 7000` gate but failed the live submit because the merged blob was 7765
     // bytes.) Reconstruct the worst-case rl_launch.py override so CI catches a regression.
-    const def = Object.values(t.findResources('AWS::Batch::JobDefinition'))[0] as any;
+    const def = jobDef('IsaacRlJobDef');
     const cmd = def.Properties.ContainerProperties.Command as string[];
     const rr = def.Properties.ContainerProperties.ResourceRequirements as any[];
     // ECS sees the JobDefinition defaults AND every key rl_launch.py can set, so the
@@ -133,8 +141,7 @@ describe('RlPatternAStack', () => {
     const fs = require('fs');
     const path = require('path');
     const zlib = require('zlib');
-    const defs = t.findResources('AWS::Batch::JobDefinition');
-    const def = Object.values(defs)[0] as any;
+    const def = jobDef('IsaacRlJobDef');
     const cmd = def.Properties.ContainerProperties.Command as string[];
     // Extract the base64 payload from the stub and round-trip it.
     const m = cmd[2].match(/b64decode\("([^"]+)"\)/);
@@ -153,8 +160,7 @@ describe('RlPatternAStack', () => {
   });
 
   test('the job definition sets the RL_* contract defaults for the reference task', () => {
-    const defs = t.findResources('AWS::Batch::JobDefinition');
-    const def = Object.values(defs)[0] as any;
+    const def = jobDef('IsaacRlJobDef');
     const envPairs = def.Properties.ContainerProperties.Environment as Array<{ Name: string; Value: any }>;
     const byName = Object.fromEntries(envPairs.map((e) => [e.Name, e.Value]));
     expect(byName['RL_TASK']).toBe('Isaac-Velocity-Rough-H1-v0');
@@ -165,11 +171,54 @@ describe('RlPatternAStack', () => {
   });
 
   test('uses the isaac-lab-rl ECR repo, NOT the vla-ft repo', () => {
-    const defs = t.findResources('AWS::Batch::JobDefinition');
-    const def = Object.values(defs)[0] as any;
+    const def = jobDef('IsaacRlJobDef');
     const image = JSON.stringify(def.Properties.ContainerProperties.Image);
     expect(image).toContain('IsaacLabRlRepo');
     expect(image).not.toContain('VlaFtRepo');
+  });
+
+  describe('VLA RLVR job definition (RLinf vendor image)', () => {
+    const vrl = () => jobDef('VlaRlJobDef');
+
+    test('pins the RLinf image by digest (no mutable tag) from Docker Hub', () => {
+      const image = vrl().Properties.ContainerProperties.Image as string;
+      expect(image).toMatch(/^docker\.io\/rlinf\/rlinf@sha256:[0-9a-f]{64}$/);
+    });
+
+    test('1 GPU, 110 GiB (fits only g6e.4xlarge), 20 GiB /dev/shm, shared EFS', () => {
+      const cp = vrl().Properties.ContainerProperties;
+      const rr = Object.fromEntries((cp.ResourceRequirements as any[]).map((r) => [r.Type, r.Value]));
+      expect(rr).toMatchObject({ GPU: '1', MEMORY: String(110 * 1024), VCPU: '16' });
+      expect(cp.LinuxParameters.SharedMemorySize).toBe(20 * 1024);
+      expect(JSON.stringify(cp.MountPoints)).toContain('/mnt/efs');
+    });
+
+    test('defaults to inspect mode with a pinned RLinf commit and the pi0.5 LIBERO SFT checkpoint', () => {
+      const env = Object.fromEntries(
+        (vrl().Properties.ContainerProperties.Environment as any[]).map((e) => [e.Name, e.Value]),
+      );
+      expect(env.VRL_MODE).toBe('inspect');
+      expect(env.VRL_RLINF_SHA).toMatch(/^[0-9a-f]{40}$/);
+      expect(env.VRL_MODEL_REPO).toBe('RLinf/RLinf-Pi05-LIBERO-SFT');
+      expect(env.VRL_CONFIG).toBe('libero_spatial_ppo_openpi_pi05');
+    });
+
+    test('the packed command decompresses to vla_rl_bootstrap.py and the worst-case override fits 8192 bytes', () => {
+      const cp = vrl().Properties.ContainerProperties;
+      const cmd = cp.Command as string[];
+      const b64 = /b64decode\("([^"]+)"\)/.exec(cmd[2])![1];
+      const restored = zlib.inflateSync(Buffer.from(b64, 'base64')).toString('utf8');
+      const orig = fs.readFileSync(path.join(__dirname, '..', 'containers', 'vla-rl', 'vla_rl_bootstrap.py'), 'utf8');
+      expect(restored).toBe(stripPyCommentLines(orig));
+      const env = (cp.Environment as any[]).map((e) => ({
+        name: e.Name,
+        value: typeof e.Value === 'string' ? e.Value : 's3://pai-artifacts-123456789012-us-west-2/vla-rl',
+      }));
+      env.push({ name: 'VRL_OVERRIDES', value: 'runner.max_epochs=200 env.train.total_num_envs=32 env.train.rollout_epoch=2 actor.micro_batch_size=64 actor.global_batch_size=256 actor.enable_offload=True rollout.enable_offload=True actor.optim.lr=1e-6' });
+      env.push({ name: 'VRL_RUN_NAME', value: 'vla-rl-libero-spatial-pi05-20261017-120000' });
+      const merged = JSON.stringify({ command: cmd, environment: env, resourceRequirements: cp.ResourceRequirements });
+      expect(Buffer.byteLength(merged, 'utf8')).toBeLessThan(8000);
+    });
   });
 
   test('three IAM roles: instance (ec2), execution (ecs-tasks), job (ecs-tasks + jobBasePolicy)', () => {

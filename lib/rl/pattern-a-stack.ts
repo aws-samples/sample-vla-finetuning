@@ -83,10 +83,20 @@ export interface RlPatternAStackProps extends cdk.StackProps {
 const JOB_VCPUS = 16;
 const JOB_MEMORY_GIB = 48;
 
+/** RLinf v0.3 (tag v0.3) and its published image, amd64 manifest of
+ *  rlinf/rlinf:agentic-rlinf0.3-maniskill_libero. Bump both together. */
+const RLINF_SHA = '0505431899574619da86f551bad70b71e0ea2177';
+const RLINF_IMAGE =
+  'docker.io/rlinf/rlinf@sha256:f76e5d0a7331820ba3d760389dc4799313ebd32f8ebae4aa0e2525ef9267d7e3';
+/** Leaves ~18 GiB of a g6e.4xlarge (128 GiB) for the host and ECS agent. */
+const VLA_RL_MEMORY_GIB = 110;
+
 export class RlPatternAStack extends cdk.Stack {
   public readonly computeEnvironment: batch.ManagedEc2EcsComputeEnvironment;
   public readonly jobQueue: batch.JobQueue;
   public readonly jobDefinition: batch.EcsJobDefinition;
+  /** VLA RLVR (RLinf PPO/GRPO on a pretrained pi0/pi0.5, reward = task success). */
+  public readonly vlaRlJobDefinition: batch.EcsJobDefinition;
   /** The role the container assumes — its AWS creds for S3 artifact I/O. */
   public readonly jobRole: iam.Role;
   public readonly notifications?: TrainingNotifications;
@@ -252,6 +262,51 @@ export class RlPatternAStack extends cdk.Stack {
       timeout: props.timeout ?? cdk.Duration.hours(12),
     });
 
+    // --- Job Definition #2: VLA RLVR on the same CE/JQ (RLinf vendor image). ---
+    // RLinf post-trains a pretrained flow-matching VLA (pi0 / pi0.5) with PPO/GRPO where
+    // the reward is task success in LIBERO (pi-RL, arXiv 2510.25889). We run RLinf's own
+    // published image unchanged, pinned by the amd64 manifest digest of tag
+    // agentic-rlinf0.3-maniskill_libero (RLinf v0.3), instead of rebuilding it: the
+    // vendor image + lock is the verified environment. RLinf mounts its code rather than
+    // baking it in, so the bootstrap clones RLinf at a pinned commit and the SFT
+    // checkpoint onto EFS (cached across jobs). The image is ~15 GB compressed; the
+    // 250 GB root volume above holds it.
+    //
+    // Resources: LIBERO rendering + rollout + FSDP actor share the one GPU (RLinf
+    // "collocated"), and RLinf's docs run the image with --shm-size 20g. The memory ask
+    // (110 GiB) only fits g6e.4xlarge (128 GiB), so this JD never lands on a g5.
+    const vlaRlBootstrapSrc = fs.readFileSync(
+      path.join(__dirname, '..', '..', 'containers', 'vla-rl', 'vla_rl_bootstrap.py'),
+      'utf8',
+    );
+    const vlaRlContainer = new batch.EcsEc2ContainerDefinition(this, 'VlaRlContainer', {
+      image: ecs.ContainerImage.fromRegistry(RLINF_IMAGE),
+      cpu: JOB_VCPUS,
+      memory: cdk.Size.gibibytes(VLA_RL_MEMORY_GIB),
+      gpu: 1,
+      jobRole: this.jobRole,
+      executionRole,
+      linuxParameters: new batch.LinuxParameters(this, 'VlaRlLinuxParams', {
+        sharedMemorySize: cdk.Size.gibibytes(20),
+      }),
+      command: ['python3', '-c', packPyBootstrap(vlaRlBootstrapSrc, 'vla_rl_bootstrap.py')],
+      volumes: [efsVolume],
+      environment: {
+        VRL_MODE: 'inspect',
+        VRL_CONFIG: 'libero_spatial_ppo_openpi_pi05',
+        VRL_MODEL_REPO: 'RLinf/RLinf-Pi05-LIBERO-SFT',
+        VRL_RLINF_SHA: RLINF_SHA,
+        VRL_RLINF_ENV: 'openpi',
+        VRL_CACHE_DIR: '/mnt/efs/vla-rl',
+        VRL_OUTPUT_S3: `s3://${base.artifactBucket.bucketName}/vla-rl`,
+      },
+    });
+    this.vlaRlJobDefinition = new batch.EcsJobDefinition(this, 'VlaRlJobDef', {
+      container: vlaRlContainer,
+      retryAttempts: 1,
+      timeout: props.timeout ?? cdk.Duration.hours(12),
+    });
+
     // --- Job-completion notifications (opt-in) — Batch job-state-change rule. ---
     if (base.notificationTopic) {
       this.notifications = new TrainingNotifications(this, 'Notifications', {
@@ -268,6 +323,10 @@ export class RlPatternAStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'JobDefinitionArn', {
       value: this.jobDefinition.jobDefinitionArn,
       description: 'Pass to rl_launch.py --job-definition',
+    });
+    new cdk.CfnOutput(this, 'VlaRlJobDefinitionArn', {
+      value: this.vlaRlJobDefinition.jobDefinitionArn,
+      description: 'VLA RLVR (RLinf) job definition; submit with VRL_MODE=inspect|eval|train',
     });
     new cdk.CfnOutput(this, 'ImageUriHint', {
       value: `${base.isaacLabRlRepo.repositoryUri}:latest`,
