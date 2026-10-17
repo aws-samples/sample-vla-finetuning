@@ -9,6 +9,13 @@ updates:
     groups:
       npm-all:
         patterns: ["*"]
+    ignore:
+      # ts-jest 29 accepts typescript <7; move both together by hand.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # Track the Node major CI runs on (22), not the latest @types/node.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: pip
     directory: /mcp
