@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run every Python unit test in the repo. Each test imports its sibling modules, so it
-# runs from its own directory. Needs only boto3 (no AWS credentials, no GPU).
+# runs from its own directory. Needs boto3 and pyarrow (no AWS credentials, no GPU).
 set -u
 cd "$(dirname "$0")/.."
 PY="${PYTHON:-python3}"
@@ -11,6 +11,7 @@ for t in \
   containers/vla-ft/test_dcp_checkpoint.py \
   containers/isaac-lab-rl/test_rl_liveness_guard.py \
   containers/gr00t-n17/test_gr00t_liveness_guard.py \
+  containers/gr00t-n17/docker/test_gr00t_awr_resample.py \
   mcp/test_mcp.py; do
   echo "== $t"
   (cd "$(dirname "$t")" && "$PY" "$(basename "$t")")

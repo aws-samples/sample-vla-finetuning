@@ -41,7 +41,7 @@ To send us a pull request, please:
 3. Ensure local tests pass:
    ```bash
    npm ci && npx tsc --noEmit && npx jest   # CDK stacks (~2-3 min)
-   pip install -r mcp/requirements.txt && scripts/run-python-tests.sh   # launcher, resume, liveness guards, MCP
+   pip install -r mcp/requirements.txt pyarrow && scripts/run-python-tests.sh   # launcher, resume, liveness guards, MCP
    (cd mcp && python check_server.py)   # the real MCP server loads (Python 3.10+)
    ```
    Neither needs AWS credentials or a GPU. CI runs the same commands on every pull request.
