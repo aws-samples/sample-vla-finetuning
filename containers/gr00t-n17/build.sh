@@ -11,10 +11,14 @@
 # builds over local docker — the CUDA devel base + locked closure is many GB, which would
 # balloon a local Docker.raw). `--local` keeps a local-docker fallback.
 #
-# The Dockerfile clones the repo itself (the Batch entrypoint is injected at submit via
-# `python3 -c`), so the only COPY'd files are g1_finetune.py (the action_horizon-aware train
-# entry) and gr00t_awr_resample.py (the AWR/RWR episode resampler, invoked only when
-# GROOT_AWR_ADVANTAGES_S3 is set). The build context is Dockerfile + those two files.
+# The Dockerfile clones the repo itself. The Batch entrypoint (gr00t_train_bootstrap.py) is
+# now BAKED (COPY) rather than injected via `python3 -c`: the AWR update-half grew the packed
+# bootstrap past Batch's 8192B container-override ceiling once per-job AWR env is added (the
+# command + env overrides are summed), so the CDK command shrinks to `python3
+# /workspace/gr00t_train_bootstrap.py`. COPY'd files: gr00t_train_bootstrap.py (Batch entry),
+# g1_finetune.py (action_horizon-aware train entry), gr00t_awr_resample.py (AWR/RWR resampler,
+# invoked only when GROOT_AWR_ADVANTAGES_S3 is set). bootstrap lives one dir up from docker/,
+# so it is staged into the build context at package time (below).
 #
 # Usage:
 #   ./build.sh [--region us-west-2] [--repo pai/gr00t-n17] [--tag latest] [--local]
@@ -57,6 +61,10 @@ aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" >/de
 if [ "$MODE" = "local" ]; then
   aws ecr get-login-password --region "$REGION" \
     | docker login --username AWS --password-stdin "$ECR"
+  # Stage the bootstrap (lives one dir up) into the build context so the Dockerfile can COPY
+  # it. Removed after the build so the tree stays clean.
+  cp "${SCRIPT_DIR}/gr00t_train_bootstrap.py" "${SCRIPT_DIR}/docker/gr00t_train_bootstrap.py"
+  trap 'rm -f "${SCRIPT_DIR}/docker/gr00t_train_bootstrap.py"' EXIT
   # --platform linux/amd64 so the CUDA image runs on GPU hosts even when built on arm64.
   docker build --platform linux/amd64 -t "$URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
   docker push "$URI"
@@ -97,10 +105,12 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name "${REPO_SLUG}-bui
     ]
   }" >/dev/null
 
-# 2. Package source (Dockerfile + g1_finetune.py + gr00t_awr_resample.py, which the Dockerfile
-#    COPYs) and upload to the CDK bucket.
+# 2. Package source (Dockerfile + gr00t_train_bootstrap.py + g1_finetune.py +
+#    gr00t_awr_resample.py, which the Dockerfile COPYs) and upload to the CDK bucket. The
+#    bootstrap lives one dir up, so it is added into the zip with a flattened path.
 TMP_ZIP="$(mktemp -d)/source.zip"
 ( cd "${SCRIPT_DIR}/docker" && zip -q "$TMP_ZIP" Dockerfile g1_finetune.py gr00t_awr_resample.py )
+( cd "${SCRIPT_DIR}" && zip -qj "$TMP_ZIP" gr00t_train_bootstrap.py )
 aws s3 cp "$TMP_ZIP" "s3://${SRC_BUCKET}/${SRC_KEY}" --region "$REGION" >/dev/null
 echo "Source uploaded: s3://${SRC_BUCKET}/${SRC_KEY}"
 

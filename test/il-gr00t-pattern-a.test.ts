@@ -2,7 +2,6 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { SharedBaseStack } from '../lib/shared/base-stack';
 import { GrootPatternAStack } from '../lib/il/gr00t-pattern-a-stack';
-import { stripPyCommentLines } from '../lib/shared/py-bootstrap';
 
 const ENV = { account: '111111111111', region: 'us-west-2' };
 const GROOT_G1_ARN = 'arn:aws:s3:::example-gr00t-g1-dataset';
@@ -63,17 +62,17 @@ describe('GrootPatternAStack', () => {
     });
   });
 
-  test('the job command injects gr00t_train_bootstrap zlib-compressed (python3 -c <stub>)', () => {
+  test('the job command runs the baked gr00t_train_bootstrap (short absolute-path invocation)', () => {
+    // The bootstrap is baked into the image (COPY /workspace/gr00t_train_bootstrap.py) rather
+    // than injected via `python3 -c "<zlib stub>"`. The AWR update-half grew the packed
+    // bootstrap so command + per-job AWR env overrides (Batch sums both) exceeded the 8192B
+    // ceiling; a short baked-path command restores the full env budget.
     const defs = t.findResources('AWS::Batch::JobDefinition');
     const def = Object.values(defs)[0] as any;
     const cmd = def.Properties.ContainerProperties.Command as string[];
-    expect(cmd[0]).toBe('python3');
-    expect(cmd[1]).toBe('-c');
-    expect(cmd[2]).toContain('import base64,zlib');
-    expect(cmd[2]).toContain('zlib.decompress');
-    expect(cmd[2]).toContain('"__name__":"__main__"');
-    // raw banner must be compressed away (not present as plaintext in the stub)
-    expect(cmd[2]).not.toContain('GR00T N1.7 fine-tune - AWS Batch bootstrap');
+    expect(cmd).toEqual(['python3', '/workspace/gr00t_train_bootstrap.py']);
+    // no `python3 -c` inline payload, no embedded stub
+    expect(cmd).not.toContain('-c');
   });
 
   test('the FULL merged ECS container override stays under Batch\'s 8192-byte limit', () => {
@@ -111,23 +110,17 @@ describe('GrootPatternAStack', () => {
     expect(bytes).toBeLessThan(8000);
   });
 
-  test('the embedded payload decompresses back to the exact gr00t_train_bootstrap source', () => {
+  test('the baked bootstrap source carries the GR00T Batch entry contract', () => {
+    // The bootstrap is now baked into the image (not embedded in the command), so the source
+    // is verified directly. build.sh stages it into the docker build context at package time.
     const fs = require('fs');
     const path = require('path');
-    const zlib = require('zlib');
-    const defs = t.findResources('AWS::Batch::JobDefinition');
-    const def = Object.values(defs)[0] as any;
-    const cmd = def.Properties.ContainerProperties.Command as string[];
-    const m = cmd[2].match(/b64decode\("([^"]+)"\)/);
-    expect(m).not.toBeNull();
-    const restored = zlib.inflateSync(Buffer.from(m![1], 'base64')).toString('utf8');
     const orig = fs.readFileSync(
       path.join(__dirname, '..', 'containers', 'gr00t-n17', 'gr00t_train_bootstrap.py'),
       'utf8',
     );
-    expect(restored).toBe(stripPyCommentLines(orig));
-    expect(restored).toContain('GR00T N1.7 fine-tune - AWS Batch bootstrap (IL GR00T Pattern A)');
-    expect(restored).toContain('GROOT_DATASET_S3');
+    expect(orig).toContain('GR00T N1.7 fine-tune - AWS Batch bootstrap (IL GR00T Pattern A)');
+    expect(orig).toContain('GROOT_DATASET_S3');
   });
 
   test('the job definition sets the GROOT_* contract defaults for the G1 reference run', () => {

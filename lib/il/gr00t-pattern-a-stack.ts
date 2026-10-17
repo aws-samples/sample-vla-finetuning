@@ -38,14 +38,11 @@
  *
  */
 import * as cdk from 'aws-cdk-lib';
-import * as fs from 'fs';
-import * as path from 'path';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as batch from 'aws-cdk-lib/aws-batch';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import { Construct } from 'constructs';
-import { packPyBootstrap } from '../shared/py-bootstrap';
 import { SharedBaseStack } from '../shared/base-stack';
 import { TrainingNotifications } from '../shared/notifications';
 
@@ -193,17 +190,16 @@ export class GrootPatternAStack extends cdk.Stack {
     });
 
     // --- Job Definition: the GR00T image; command = the GR00T Batch bootstrap. ---
-    // gr00t_train_bootstrap.py is read at synth and injected via `python3 -c "<stub>"`, so
-    // the image stays task-agnostic and is never rebuilt to carry glue. The raw bootstrap
-    // exceeds Batch's 8192-byte ECS container-override ceiling, so we zlib-compress at
-    // synth and inject a decompress-and-run stub (Node deflate ↔ Python zlib.decompress is
-    // interoperable; exec under __name__='__main__' fires main()). Same trap/solution as
-    // the RL Pattern A stack.
-    const bootstrapSrc = fs.readFileSync(
-      path.join(__dirname, '..', '..', 'containers', 'gr00t-n17', 'gr00t_train_bootstrap.py'),
-      'utf8',
-    );
-    const bootstrapStub = packPyBootstrap(bootstrapSrc, 'gr00t_train_bootstrap.py');
+    // gr00t_train_bootstrap.py is now BAKED into the image (COPY /workspace/), so the command
+    // is a short absolute-path invocation. It was formerly injected via `python3 -c "<zlib
+    // stub>"` to keep the image task-agnostic, but the AWR update-half grew the packed
+    // bootstrap so that command + per-job AWR env overrides (Batch sums both) exceeded the
+    // 8192-byte ECS container-override ceiling. Baking the bootstrap (same move already used
+    // for g1_finetune.py / gr00t_awr_resample.py) drops the command to ~40 bytes and restores
+    // the full 8192B budget for env overrides. The engine code still lives beside the checkout
+    // in /workspace so its subprocess imports resolve. (containers/gr00t-n17/build.sh stages
+    // gr00t_train_bootstrap.py into the build context.)
+    const bootstrapCommand = ['python3', '/workspace/gr00t_train_bootstrap.py'];
 
     // --- /dev/shm sizing. The GR00T PyTorch DataLoader hands large multi-camera image
     // tensors (UNITREE_G1 ego_view 480x640x3, both arms) between worker processes via
@@ -223,7 +219,7 @@ export class GrootPatternAStack extends cdk.Stack {
       jobRole: this.jobRole,
       executionRole,
       linuxParameters,
-      command: ['python3', '-c', bootstrapStub],
+      command: bootstrapCommand,
       // Static defaults; per-job values (dataset, output, steps, GPUs) arrive as
       // container-override environment at SubmitJob time (see gr00t_launch.py). Defaults
       // make the JobDefinition runnable as-is for the G1 reference dataset.

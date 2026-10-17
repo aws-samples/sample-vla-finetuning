@@ -31,11 +31,14 @@ build failures.
   same as vla-ft Pattern A on the same base.
 
 The image is **task-generic** — dataset, steps, embodiment, and all knobs are injected at
-submit time. Like the other Pattern A engines, the Batch entrypoint
-(`gr00t_train_bootstrap.py`) is **not baked in**; the `lib/il/gr00t-pattern-a-stack.ts`
-Job Definition reads it at synth and injects it **zlib-compressed** via `python3 -c
-"<stub>"` (the raw bootstrap exceeds Batch's 8192-byte ECS container-override ceiling —
-the same trap RL hit; held under 7000).
+submit time. The Batch entrypoint (`gr00t_train_bootstrap.py`) is **baked into the image**
+(`COPY /workspace/gr00t_train_bootstrap.py`), and `lib/il/gr00t-pattern-a-stack.ts` runs it
+with a short command (`python3 /workspace/gr00t_train_bootstrap.py`). It was formerly
+injected **zlib-compressed** via `python3 -c "<stub>"`, but the AWR update-half grew the
+packed bootstrap so that command + per-job AWR env overrides (Batch **sums** the command and
+environment overrides at SubmitJob) exceeded the 8192-byte ECS container-override ceiling.
+Baking it — the same move already used for `g1_finetune.py` / `gr00t_awr_resample.py` — drops
+the command to ~40 bytes and restores the full 8192B budget for env overrides.
 
 > **HF note**: `nvidia/GR00T-N1.7-3B` is an **ungated** ~6 GB HF model, downloaded at
 > runtime. No HF token is required; `--hf-token-ssm` is an optional escape hatch if HF

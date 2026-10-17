@@ -82,6 +82,14 @@ COPY g1_finetune.py /workspace/g1_finetune.py
 # only stdlib + boto3 + pyarrow, all in the locked venv (pyarrow is a LeRobot dependency).
 COPY gr00t_awr_resample.py /workspace/gr00t_awr_resample.py
 
+# Bake the Batch entrypoint (gr00t_train_bootstrap.py) rather than injecting it via
+# `python3 -c "<zlib stub>"`. The AWR update-half grew the packed bootstrap past Batch's
+# 8192B container-override ceiling once per-job AWR env vars are added (Batch sums the command
+# and environment overrides), so the CDK JobDefinition command shrinks to
+# `python3 /workspace/gr00t_train_bootstrap.py`. stdlib + boto3 only; uses absolute /workspace
+# paths for its subprocesses (g1_finetune.py / gr00t_awr_resample.py / stats.py).
+COPY gr00t_train_bootstrap.py /workspace/gr00t_train_bootstrap.py
+
 # Make the venv the default interpreter. The injected `python3 -c "<bootstrap>"` command
 # (and the launch_finetune.py / stats.py / g1_finetune.py subprocesses it spawns via
 # sys.executable) then run inside the venv with the full gr00t stack + boto3. Headless GL
