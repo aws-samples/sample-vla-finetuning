@@ -247,7 +247,8 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
     if missing:
         raise RuntimeError(f"orchestrator stack did not inject {missing} — is GR00T Pattern A wired?")
 
-    job_name = submit.get("job_name") or f"gr00t-n17-{time.strftime('%Y%m%d-%H%M%S')}"
+    name_prefix = "gr00t-awr" if submit.get("advantages_s3") else "gr00t-n17"
+    job_name = submit.get("job_name") or f"{name_prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
 
     # GROOT_* contract consumed by gr00t_train_bootstrap.py — identical key set + values to
     # gr00t_launch.py (the verified launcher). The trainer (launch_finetune.py) is baked in
@@ -271,6 +272,22 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
     if submit.get("extra"):
         env["GROOT_EXTRA_ARGS"] = " ".join(submit["extra"])
 
+    # AWR (RL update-half): when advantages_s3 is set, the baked gr00t_awr_resample.py upsamples
+    # high-advantage rollout episodes before training. Same image/queue/jobdef — only the env
+    # differs, so this reuses the GR00T engine wholesale (no separate stack/queue). Unset -> the
+    # bootstrap skips the resampler -> byte-identical to a plain GR00T fine-tune.
+    is_awr = bool(submit.get("advantages_s3"))
+    if is_awr:
+        env["GROOT_AWR_ADVANTAGES_S3"] = submit["advantages_s3"]
+        if submit.get("awr_beta") is not None:
+            env["GROOT_AWR_BETA"] = str(submit["awr_beta"])
+        if submit.get("awr_max_dup") is not None:
+            env["GROOT_AWR_MAX_DUP"] = str(submit["awr_max_dup"])
+        if submit.get("awr_allow_drop"):
+            env["GROOT_AWR_ALLOW_DROP"] = "1"
+        if submit.get("awr_drop_below") is not None:
+            env["GROOT_AWR_DROP_BELOW"] = str(submit["awr_drop_below"])
+
     # HF token: GR00T's VLM backbone (nvidia/Cosmos-Reason2-2B) is GATED and downloads at
     # runtime, so the token is REQUIRED (not optional like the GR00T-N1.7-3B repo itself).
     # Read here, inject as env — never into the JobDefinition / CloudWatch / SFN history.
@@ -290,7 +307,8 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
         containerOverrides=container_overrides,
         **_timeout_kwarg(submit),
     )
-    return {"status": "submitted", "backend": "batch", "axis": "gr00t",
+    return {"status": "submitted", "backend": "batch",
+            "axis": "gr00t_awr" if is_awr else "gr00t",
             "job_name": job_name, "job_id": resp["jobId"],
             "output_s3": f"{output_s3.rstrip('/')}/{job_name}/output/"}
 

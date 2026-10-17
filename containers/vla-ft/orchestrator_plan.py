@@ -137,7 +137,12 @@ def _groot_plan(event: dict) -> dict:
 
     The intent is a LeRobot dataset + a registered embodiment tag (e.g. UNITREE_G1). GR00T
     runs on the single deployed GrootPatternAStack (Batch, 1×L40S), so the decision is
-    always Pattern A; the submit Lambda maps this onto gr00t_launch.py's GROOT_* contract."""
+    always Pattern A; the submit Lambda maps this onto gr00t_launch.py's GROOT_* contract.
+
+    AWR (RL update-half): if `advantages_s3` is present, the SAME engine (image/queue/jobdef)
+    runs an advantage-weighted-regression fine-tune — the baked resampler upsamples high-
+    advantage rollout episodes before training. It is not a separate axis (same substrate); the
+    submit Lambda adds the GROOT_AWR_* env and labels the run 'gr00t_awr' for provenance."""
     profile = dec.profile_groot(
         embodiment_tag=event.get("embodiment_tag"),
         base_model=event.get("base_model"),
@@ -174,6 +179,13 @@ def _groot_plan(event: dict) -> dict:
         "extra": event.get("extra") or [],
         # Per-job Batch attempt timeout (None → JobDefinition default; no redeploy needed).
         "timeout_s": _resolve_timeout_s(event),
+        # AWR (RL update-half) knobs — passthrough; only meaningful when advantages_s3 is set.
+        # None values are dropped in the submit env so a plain GR00T fine-tune is unaffected.
+        "advantages_s3": event.get("advantages_s3"),
+        "awr_beta": event.get("awr_beta"),
+        "awr_max_dup": event.get("awr_max_dup"),
+        "awr_allow_drop": event.get("awr_allow_drop"),
+        "awr_drop_below": event.get("awr_drop_below"),
     }
     return _envelope("gr00t", profile, decision, submit,
                      dec.format_groot_plan(profile, decision))

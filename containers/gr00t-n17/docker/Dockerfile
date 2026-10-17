@@ -75,6 +75,13 @@ RUN uv pip install --python /workspace/.venv/bin/python -e . --no-deps
 # replace it. The build context is containers/gr00t-n17/docker (Dockerfile + this file).
 COPY g1_finetune.py /workspace/g1_finetune.py
 
+# Bake the AWR/RWR episode resampler (the RL update-half). The bootstrap invokes it only when
+# GROOT_AWR_ADVANTAGES_S3 is set, to upsample high-advantage rollout episodes before training;
+# unset -> never called -> byte-identical to the plain GR00T fine-tune. Engine code (not
+# orchestration glue), so baking it keeps the zlib bootstrap under Batch's 8192B ceiling. Uses
+# only stdlib + boto3 + pyarrow, all in the locked venv (pyarrow is a LeRobot dependency).
+COPY gr00t_awr_resample.py /workspace/gr00t_awr_resample.py
+
 # Make the venv the default interpreter. The injected `python3 -c "<bootstrap>"` command
 # (and the launch_finetune.py / stats.py / g1_finetune.py subprocesses it spawns via
 # sys.executable) then run inside the venv with the full gr00t stack + boto3. Headless GL

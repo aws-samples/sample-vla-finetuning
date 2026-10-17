@@ -90,6 +90,11 @@ def submit_finetune(
     global_batch: int | None = None,
     learning_rate: float | None = None,
     liveness_deadline_s: int | None = None,
+    advantages_s3: str | None = None,
+    awr_beta: float | None = None,
+    awr_max_dup: int | None = None,
+    awr_allow_drop: bool = False,
+    awr_drop_below: float | None = None,
     num_envs: int | None = None,
     max_iterations: int | None = None,
     num_gpus: int = 1,
@@ -217,6 +222,20 @@ def submit_finetune(
         event["learning_rate"] = learning_rate
     if liveness_deadline_s is not None:
         event["liveness_deadline_s"] = liveness_deadline_s
+    # AWR (GR00T RL update-half): advantages_s3 turns a GR00T fine-tune into an
+    # advantage-weighted-regression run (baked resampler upsamples high-advantage rollout
+    # episodes before training). Same image/queue/jobdef; the submit Lambda adds GROOT_AWR_*
+    # env and labels the run axis='gr00t_awr'. The other awr_* knobs tune the resampler.
+    if advantages_s3 is not None:
+        event["advantages_s3"] = advantages_s3
+    if awr_beta is not None:
+        event["awr_beta"] = awr_beta
+    if awr_max_dup is not None:
+        event["awr_max_dup"] = awr_max_dup
+    if awr_allow_drop:
+        event["awr_allow_drop"] = True
+    if awr_drop_below is not None:
+        event["awr_drop_below"] = awr_drop_below
     # Drop Nones so orchestrator_plan's .get() defaults apply.
     event = {k: v for k, v in event.items() if v is not None}
 

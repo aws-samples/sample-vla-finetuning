@@ -22,6 +22,11 @@ STATS_SCRIPT = "gr00t/data/stats.py"
 # config.model.action_horizon then runpy's launch_finetune; otherwise it is byte-identical to
 # launch_finetune. Needed for the UNITREE_G1 full-body 50-step horizon (no upstream flag).
 G1_FINETUNE_SCRIPT = "/workspace/g1_finetune.py"
+# Baked AWR/RWR episode resampler (abs path in the image). Only invoked when
+# GROOT_AWR_ADVANTAGES_S3 is set (the RL update-half): it upsamples high-advantage rollout
+# episodes in the synced dataset BEFORE stats, then the byte-identical fine-tune runs on the
+# reshaped data. Unset -> never called -> byte-identical to the plain GR00T fine-tune.
+AWR_RESAMPLE_SCRIPT = "/workspace/gr00t_awr_resample.py"
 GRACEFUL_RCS = (0, -15, 128 + 15)  # 0, bare SIGTERM, 128+SIGTERM = graceful (Spot reclaim)
 # Training markers (verified vs GR00T 65cc4a192e6d + transformers 4.57.3): per-step HF
 # Trainer stdout dict ('loss' + 'learning_rate', logging_steps=10) or stderr "Starting
@@ -104,6 +109,27 @@ def _heal_modality_annotation(data_dir):
 def _venv_python():
     cand = "/workspace/.venv/bin/python"  # venv carrying the gr00t stack
     return cand if os.path.exists(cand) else sys.executable
+
+
+def _maybe_awr_resample(py, data_dir):
+    # AWR/RWR update-half: when GROOT_AWR_ADVANTAGES_S3 is set, run the baked resampler over the
+    # synced dataset (upsample high-advantage rollout episodes). It reads GROOT_AWR_BETA /
+    # GROOT_AWR_MAX_DUP / GROOT_AWR_ALLOW_DROP / GROOT_AWR_DROP_BELOW from env. Failure is FATAL:
+    # silently training on unweighted data would be a misleading "AWR" run. No-op when unset, so
+    # this image stays byte-identical to the plain GR00T fine-tune for the IL path.
+    adv_s3 = os.environ.get("GROOT_AWR_ADVANTAGES_S3")
+    if not adv_s3:
+        return
+    if not os.path.exists(AWR_RESAMPLE_SCRIPT):
+        print(f"[gr00t-bootstrap] FATAL: GROOT_AWR_ADVANTAGES_S3 set but {AWR_RESAMPLE_SCRIPT} "
+              f"missing from image", flush=True)
+        sys.exit(2)
+    cmd = [py, AWR_RESAMPLE_SCRIPT, "--data-dir", data_dir, "--advantages-s3", adv_s3]
+    print(f"[gr00t-bootstrap] AWR resample: {' '.join(cmd)}", flush=True)
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print(f"[gr00t-bootstrap] FATAL: AWR resample failed rc={rc}", flush=True)
+        sys.exit(rc)
 
 
 def _build_stats_cmd(py, groot_dir, dataset_dir, embodiment_tag, modality_cfg):
@@ -277,6 +303,11 @@ def main():
 
     # 1b. Heal a common producer omission: annotation original_key -> task_index.
     _heal_modality_annotation(data_dir)
+
+    # 1c. (AWR update-half, optional) Advantage-weighted episode resampling. Only when
+    # GROOT_AWR_ADVANTAGES_S3 is set: upsample high-advantage rollout episodes IN PLACE before
+    # stats runs (stats must see the final episode set). Unset -> skipped -> byte-identical.
+    _maybe_awr_resample(py, data_dir)
 
     # 2. Generate stats (MANDATORY: loader asserts meta/stats.json + relative_stats.json).
     stats_cmd = _build_stats_cmd(py, groot_dir, data_dir, embodiment_tag, modality_cfg)

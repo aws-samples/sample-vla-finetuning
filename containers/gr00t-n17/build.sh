@@ -12,8 +12,9 @@
 # balloon a local Docker.raw). `--local` keeps a local-docker fallback.
 #
 # The Dockerfile clones the repo itself (the Batch entrypoint is injected at submit via
-# `python3 -c`), so the only COPY'd file is g1_finetune.py (the action_horizon-aware train
-# entry). The build context is therefore Dockerfile + g1_finetune.py.
+# `python3 -c`), so the only COPY'd files are g1_finetune.py (the action_horizon-aware train
+# entry) and gr00t_awr_resample.py (the AWR/RWR episode resampler, invoked only when
+# GROOT_AWR_ADVANTAGES_S3 is set). The build context is Dockerfile + those two files.
 #
 # Usage:
 #   ./build.sh [--region us-west-2] [--repo pai/gr00t-n17] [--tag latest] [--local]
@@ -96,10 +97,10 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name "${REPO_SLUG}-bui
     ]
   }" >/dev/null
 
-# 2. Package source (Dockerfile + g1_finetune.py, which the Dockerfile COPYs) and upload
-#    to the CDK bucket.
+# 2. Package source (Dockerfile + g1_finetune.py + gr00t_awr_resample.py, which the Dockerfile
+#    COPYs) and upload to the CDK bucket.
 TMP_ZIP="$(mktemp -d)/source.zip"
-( cd "${SCRIPT_DIR}/docker" && zip -q "$TMP_ZIP" Dockerfile g1_finetune.py )
+( cd "${SCRIPT_DIR}/docker" && zip -q "$TMP_ZIP" Dockerfile g1_finetune.py gr00t_awr_resample.py )
 aws s3 cp "$TMP_ZIP" "s3://${SRC_BUCKET}/${SRC_KEY}" --region "$REGION" >/dev/null
 echo "Source uploaded: s3://${SRC_BUCKET}/${SRC_KEY}"
 

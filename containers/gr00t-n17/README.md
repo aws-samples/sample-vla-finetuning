@@ -55,7 +55,9 @@ multi-hour fine-tune with no EFS-resume; a Spot reclaim would restart from scrat
 |---|---|
 | `docker/Dockerfile` | the verified GR00T stack (Isaac-GR00T @ 65cc4a192e6d, `uv sync` from upstream's lock) |
 | `docker/g1_finetune.py` | baked thin universal train entry. With `GROOT_ACTION_HORIZON` set it patches `config.model.action_horizon` (+ the model-config class, so the `from_pretrained`-built model's saved `config.json` also gets it) then re-runs `launch_finetune.py` via runpy; unset = byte-identical to launch_finetune. Needed for the UNITREE_G1 50-step horizon (no upstream flag). See action_horizon note below. |
-| `gr00t_train_bootstrap.py` | Batch glue: sync dataset S3→writable local, generate `meta/stats.json` (+ `relative_stats.json`), run `launch_finetune.py` under a fail-fast liveness guard, upload the merged 3B ckpt → S3. stdlib + boto3; injected via `python3 -c`. |
+| `docker/gr00t_awr_resample.py` | baked AWR/RWR episode resampler (the RL update-half). Invoked by the bootstrap ONLY when `GROOT_AWR_ADVANTAGES_S3` is set: upsamples high-advantage rollout episodes (multiplicity ∝ exp(adv/β)) in the synced LeRobot dataset before stats, then the byte-identical fine-tune runs on the reshaped data. Unset = never called. See AWR note below. stdlib + boto3 + pyarrow. |
+| `docker/test_gr00t_awr_resample.py` | offline self-test for the resampler (pure AWR math + LeRobot v2.1 file surgery; no GPU/network). |
+| `gr00t_train_bootstrap.py` | Batch glue: sync dataset S3→writable local, (optional AWR resample), generate `meta/stats.json` (+ `relative_stats.json`), run `launch_finetune.py` under a fail-fast liveness guard, upload the merged 3B ckpt → S3. stdlib + boto3; injected via `python3 -c`. |
 | `gr00t_launch.py` | Batch `SubmitJob` wrapper — sets the `GROOT_*` container-override env the bootstrap reads. All queue/def/output values come from `GrootPatternAStack` outputs. |
 | `test_gr00t_liveness_guard.py` | unit tests for the liveness guard (GR00T-verified signals). |
 | `build.sh` | build + push to ECR `pai/gr00t-n17` (CodeBuild default, `--local` fallback). |
@@ -105,6 +107,44 @@ processor pads data to 50) but the saved `config.json`/`final_model_config.json`
 while the processor expected (50,7) → broadcast crash. The first full FT (`...103523`) had to be
 hot-fixed by hand-editing the saved config 40→50 (`...103523-h50fix`). Patch #2 makes future G1
 FTs save `config.json=50` directly. With `GROOT_ACTION_HORIZON` unset, neither patch fires.
+
+## ★ AWR / RWR — advantage-weighted episode resampling (the RL update-half)
+
+This image doubles as the **update-half of a decomposed online RL-FT loop** (RECAP/AWR family):
+a separate rollout substrate (the eval AMI) runs the current policy in sim, scores each episode
+with a reward-derived advantage, and writes `{a LeRobot dataset + advantages.json}` to S3. This
+container then fine-tunes with those episodes **weighted by advantage**, pulling the policy
+toward successful behaviour (e.g. the place step that imitation left at 0/10) without any RL
+algorithm in the trainer.
+
+**Why resampling, not per-transition loss weighting.** GR00T's action head reduces the
+flow-matching loss to a scalar inside `model.forward`, `Gr00tTrainer.compute_loss` returns that
+scalar, and the collator (`processing_gr00t_n1d7.py`) drops every non-modality key — so a
+per-transition advantage can never reach the loss without a fragile multi-layer monkeypatch
+that would only fail at GPU runtime (verified @65cc4a192e6d). Instead `gr00t_awr_resample.py`
+materialises episode _i_ with multiplicity mᵢ ∝ exp((advᵢ−max)/β), then runs the
+**byte-identical** verified fine-tune on the reshaped dataset. This is reward-weighted
+regression at **episode** granularity — coarser than per-transition AWR, but faithful (zero
+training-internal patching) and well matched to our sparse success/place signal.
+
+**Env contract** (all optional; unset `GROOT_AWR_ADVANTAGES_S3` ⇒ the resampler is never
+invoked ⇒ byte-identical to a plain GR00T fine-tune):
+
+| env | meaning |
+|---|---|
+| `GROOT_AWR_ADVANTAGES_S3` | S3 uri to advantages JSON — `{"beta"?: β, "advantages": {"<episode_index>": adv, …}}` or a bare `{episode_index: adv}` map. Presence turns the run into AWR. |
+| `GROOT_AWR_BETA` | temperature β (default 1.0; smaller ⇒ sharper upweighting). Precedence: CLI > env > JSON > 1.0. |
+| `GROOT_AWR_MAX_DUP` | cap on copies per episode (default 8). |
+| `GROOT_AWR_ALLOW_DROP` | set ⇒ episodes with adv < `GROOT_AWR_DROP_BELOW` are dropped (filtered BC). |
+| `GROOT_AWR_DROP_BELOW` | drop threshold (default 0.0). |
+
+The resampler physically duplicates each upsampled episode (rewriting the parquet
+`episode_index` + global `index` columns, copying video files, appending `meta/episodes.jsonl`,
+bumping `meta/info.json` counters) — no LeRobot loader constructor accepts an episode-list or
+per-episode weight @65cc4a192e6d, so file surgery is the only faithful lever. Originals are
+append-preserved (only `--allow-drop` rewrites `episodes.jsonl`). **1-shot gap:** the offline
+test proves the reshaped dataset is self-consistent, not that the loader accepts it — that is
+confirmed only by the first GPU run.
 
 ## Liveness guard (booted-but-idle → fast exit-42)
 
