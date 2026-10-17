@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # One weekly PR for all npm updates instead of one PR per package.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-all:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /mcp
+    schedule:
+      interval: weekly
+    groups:
+      pip-all:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions-all:
+        patterns: ["*"]
