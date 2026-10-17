@@ -108,6 +108,11 @@ def resolve_wiring(sess: boto3.Session, *, hf_token_ssm: str | None,
     g = safe(STACK_GROOT_A)
     if g:
         env["GROOT_A_JOB_QUEUE"] = g.get("JobQueueArn", "")
+        # Spot queue for per-job spot=True. Falls back to the (On-Demand) default queue if the
+        # stack predates the dual-queue output, so submit never breaks — but note the caller
+        # must verify the resolved queue's CE is actually crType=SPOT: a stack output named
+        # "...Spot" is a LABEL, not a measurement (a sealed/DISABLED spot queue has shipped here).
+        env["GROOT_A_JOB_QUEUE_SPOT"] = g.get("JobQueueArnSpot", "") or g.get("JobQueueArn", "")
         env["GROOT_A_JOB_DEFINITION"] = g.get("JobDefinitionArn", "")
         env["GROOT_A_OUTPUT_S3"] = g.get("OutputS3Hint", "")
     b = safe(STACK_IL_B)
@@ -126,7 +131,8 @@ def plan_intent(event: dict) -> dict:
 
 def submit_intent(event: dict, *, region: str | None = None,
                   hf_token_ssm: str | None = None,
-                  hf_token_ssm_region: str | None = None) -> dict:
+                  hf_token_ssm_region: str | None = None,
+                  wiring_override: dict | None = None) -> dict:
     """Plan + submit by running the orchestrator code in-process with env wiring from CFN.
 
     Returns the orchestrator_submit envelope: {status, backend, axis, job_name, job_id,
@@ -149,6 +155,12 @@ def submit_intent(event: dict, *, region: str | None = None,
         hf_token_ssm=hf_token_ssm or DEFAULT_HF_TOKEN_SSM,
         hf_token_ssm_region=hf_token_ssm_region or DEFAULT_HF_TOKEN_SSM_REGION,
     )
+    # Applied AFTER resolve_wiring, which would otherwise clobber a plain os.environ export.
+    # Needed because a stack output named "...Spot" is a LABEL, not a measurement: this account
+    # ships a JobQueueArnSpot pointing at a DISABLED queue, so the caller must be able to steer
+    # to a queue it verified (crType=SPOT + ENABLED) at the destination.
+    if wiring_override:
+        wiring = {**wiring, **wiring_override}
     # Inject the env contract orchestrator_submit reads, run it, then restore os.environ.
     saved = {k: os.environ.get(k) for k in wiring}
     try:

@@ -174,6 +174,10 @@ def _groot_plan(event: dict) -> dict:
         "learning_rate": event.get("learning_rate"),
         "num_gpus": decision.num_gpus,
         "instance_type": decision.instance_type,
+        # Spot vs On-Demand picks the QUEUE at submit, exactly as the IL axis does. Without
+        # this key _submit_groot_batch had nothing to branch on, so every GR00T job rode the
+        # On-Demand queue while plan_text printed "Spot @ $x/hr".
+        "spot": decision.spot,
         "image_uri": event.get("image_uri"),  # advisory on Batch (see _il_plan / _envelope)
         "liveness_deadline_s": event.get("liveness_deadline_s"),
         "extra": event.get("extra") or [],

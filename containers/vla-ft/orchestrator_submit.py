@@ -239,7 +239,13 @@ def _submit_rl_batch(session, region: str, submit: dict) -> dict:
 
 # ── GR00T Pattern A (AWS Batch) — direct submit, faithful to gr00t_launch.py ────────
 def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) -> dict:
-    queue = _env("GROOT_A_JOB_QUEUE")
+    # Per-job Spot vs On-Demand: pick the queue, NOT a CE property — identical contract to
+    # _submit_il_batch. GROOT_A_JOB_QUEUE_SPOT falls back to the On-Demand queue if the stack
+    # predates the dual-queue wiring, so spot=True degrades gracefully instead of crashing.
+    queue_od = _env("GROOT_A_JOB_QUEUE")
+    queue_spot = _env("GROOT_A_JOB_QUEUE_SPOT") or queue_od
+    use_spot = submit.get("spot", False)  # GR00T stack default is On-Demand
+    queue = queue_spot if use_spot else queue_od
     jobdef = _env("GROOT_A_JOB_DEFINITION")
     output_s3 = _env("GROOT_A_OUTPUT_S3")
     missing = [k for k, v in {"GROOT_A_JOB_QUEUE": queue, "GROOT_A_JOB_DEFINITION": jobdef,
@@ -253,9 +259,13 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
     # GROOT_* contract consumed by gr00t_train_bootstrap.py — identical key set + values to
     # gr00t_launch.py (the verified launcher). The trainer (launch_finetune.py) is baked in
     # the image, so unlike IL Pattern A there is NO train.py upload step.
+    ckpt_root = (submit.get("checkpoint_root") or "/mnt/efs/gr00t-n17/checkpoints").rstrip("/")
     env = {
         "GROOT_DATASET_S3": submit["dataset_s3"],
         "GROOT_OUTPUT_S3": f"{output_s3.rstrip('/')}/{job_name}",
+        # Per-job checkpoint dir under the EFS mount. The JobDefinition default is a SHARED
+        # path, so leaving this unset would let two jobs resume from each other's checkpoints.
+        "GROOT_OUTPUT_DIR": f"{ckpt_root}/{job_name}",
         "GROOT_BASE_MODEL": submit.get("base_model") or "nvidia/GR00T-N1.7-3B",
         "GROOT_EMBODIMENT_TAG": submit.get("embodiment_tag") or "UNITREE_G1",
         "GROOT_MAX_STEPS": str(submit["max_steps"]),
@@ -310,6 +320,8 @@ def _submit_groot_batch(session, region: str, submit: dict, *, want_hf: bool) ->
     return {"status": "submitted", "backend": "batch",
             "axis": "gr00t_awr" if is_awr else "gr00t",
             "job_name": job_name, "job_id": resp["jobId"],
+            "queue": "spot" if use_spot else "on-demand",
+            "queue_arn": queue,
             "output_s3": f"{output_s3.rstrip('/')}/{job_name}/output/"}
 
 

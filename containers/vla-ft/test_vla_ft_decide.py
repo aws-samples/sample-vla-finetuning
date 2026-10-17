@@ -607,6 +607,32 @@ def test_groot():
           "submit: GROOT_OUTPUT_S3 = <hint>/<job> (matches gr00t_launch.py)")
     check(env.get("HF_TOKEN") == "hf_FAKE_TOKEN" and env.get("HUGGING_FACE_HUB_TOKEN") == "hf_FAKE_TOKEN",
           "submit: HF token injected (gated Cosmos-Reason2-2B backbone is REQUIRED)")
+
+    # GR00T dual-queue (regression: the axis had NO spot/od branch, so every job rode the
+    # On-Demand queue while plan_text printed "Spot @ $x/hr" — the plan's spot flag was
+    # decorative). The plan must carry `spot`, and the submit must pick the queue from it.
+    check(plan_g["submit"].get("spot") is False,
+          "plan: GR00T submit carries spot (default False = stack On-Demand)")
+    check(op.plan({"dataset": "s3://b/ds/", "embodiment_tag": "UNITREE_G1",
+                   "spot": True})["submit"]["spot"] is True,
+          "plan: GR00T spot=True reaches submit (was dropped → silent On-Demand)")
+    os.environ["GROOT_A_JOB_QUEUE_SPOT"] = "arn:aws:batch:us-west-2:428:job-queue/groot-spot"
+    out_sp = osub._submit_groot_batch(_FakeSession(), "us-west-2",
+                                      {**s, "spot": True, "timeout_s": 7200}, want_hf=False)
+    check(captured["jobQueue"].endswith("/groot-spot"), "submit: GR00T spot=True → Spot queue")
+    check(out_sp["queue"] == "spot" and out_sp["queue_arn"].endswith("/groot-spot"),
+          "submit: GR00T return labels the resolved queue (spot)")
+    check(captured.get("timeout") == {"attemptDurationSeconds": 7200},
+          "submit: GR00T timeout_s reaches SubmitJob (hard wall-clock)")
+    out_od2 = osub._submit_groot_batch(_FakeSession(), "us-west-2",
+                                       {**s, "spot": False}, want_hf=False)
+    check(captured["jobQueue"].endswith("/groot") and out_od2["queue"] == "on-demand",
+          "submit: GR00T spot=False → On-Demand queue")
+    # Older stack (no Spot output) → spot=True degrades to the default queue, never crashes.
+    os.environ.pop("GROOT_A_JOB_QUEUE_SPOT", None)
+    osub._submit_groot_batch(_FakeSession(), "us-west-2", {**s, "spot": True}, want_hf=False)
+    check(captured["jobQueue"].endswith("/groot"),
+          "submit: GR00T spot=True with no Spot queue → falls back (no crash)")
     # dispatch routes a gr00t plan to _submit_groot_batch (no live boto3: spy the branch +
     # neutralize boto3.Session so submit()'s session build never touches AWS).
     import boto3 as _boto3
