@@ -99,6 +99,12 @@ deterministic Step Functions orchestrator only when scale justifies it (§3).
   uploaded to S3 (`<output-s3>/<job>/output/<run>/`, sim2real-ready). `logs/` lives on
   EFS so a Spot reclaim + Batch retry resumes PPO (`--resume`) from the last checkpoint.
 
+- **RLVR variant (VLA post-training)**: the same RL Pattern A queue also takes a
+  `VlaRlJobDef` that runs RLinf's published image (`containers/vla-rl/vla_rl_bootstrap.py`):
+  PPO on a pretrained π0/π0.5 in LIBERO with reward = task success. Input = an RLinf config
+  name + an HF SFT checkpoint; output = actor checkpoints (`full_weights.pt`) + eval videos
+  and tensorboard scalars in S3. PoC: LIBERO-Spatial 0.815 → 0.885 on 1×L40S (ROADMAP Phase 3).
+
 > **Why RL is not just "another Pattern"**: RL needs the simulator in the loop
 > (Isaac Sim/Lab), thousands of parallel envs on the GPU, and a reward — a different
 > container and a different success signal than supervised FT. It shares the

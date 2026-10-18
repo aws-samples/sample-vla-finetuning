@@ -17,7 +17,8 @@ there is no GPU left running and no cleanup to remember.
 
 > **Status at a glance.** The imitation-learning (IL) path is built, with Pattern A
 > (AWS Batch) verified end-to-end on a real dataset. The reinforcement-learning (RL) path
-> is code-complete but not yet run on a GPU. The [Status](#status) section gives the
+> is smoke-verified on GPU, and RL post-training of a pretrained VLA (RLVR) ran a full
+> PoC: LIBERO-Spatial success 0.815 → 0.885 on one GPU. The [Status](#status) section gives the
 > honest per-component breakdown — this README does not oversell what is built.
 
 ## Architecture at a glance
@@ -217,7 +218,8 @@ pai-training-platform/          (product: vla-ft)
 ├── containers/
 │   ├── vla-ft/                the verified LeRobot VLA FT container (the IL engine);
 │   │                            also holds vla_ft_decide / cli + orchestrator plan/submit Lambdas
-│   └── isaac-lab-rl/          Isaac Lab RL container (headless PPO via rsl_rl)
+│   ├── isaac-lab-rl/          Isaac Lab RL container (headless PPO via rsl_rl)
+│   └── vla-rl/                RLVR glue for RLinf's published image (PPO on a pretrained pi0/pi0.5)
 ├── mcp/                       optional MCP server (built, 7 tools) — submit / monitor / checkpoint-verify from an agent session
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
@@ -239,6 +241,15 @@ pai-training-platform/          (product: vla-ft)
   `exported/policy.onnx` + `policy.pt` and checkpoints to S3. That proves the pipeline
   (deploy → submit → train → ONNX export → upload), not policy quality: 100 iterations is
   far short of convergence. A full-length reference run is the remaining RL check.
+- **VLA RLVR (RL post-training of a pretrained VLA): PoC verified, modest gain.** A second
+  job definition on the same RL Pattern A queue runs [RLinf](https://github.com/RLinf/RLinf)
+  v0.3's published image (pinned by digest) with `containers/vla-rl/vla_rl_bootstrap.py`
+  (`inspect` / `eval` / `train`). PPO on the public π0.5 few-shot SFT checkpoint in
+  LIBERO-Spatial, reward = task success, 120 steps × 64 trajectories on 1×L40S
+  (g6e.8xlarge On-Demand, ~16 h, ~$73): success **0.815 → 0.885** on the same 200 reset
+  states (+7.0 pt, one-sided Fisher p = 0.034, paired McNemar p = 0.014). The gain came
+  from the weakest tasks; the pre-registered +10 pt target was not reached — this run used
+  1/8 of RLinf's default rollout batch, so GPU count is the lever, not the algorithm.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase-by-phase breakdown of what is
 verified vs designed.
@@ -284,6 +295,10 @@ does not (it is AWS-only and not a ParallelCluster replacement).
 This README does not oversell. The same caveats are tracked in
 [`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md):
 
+- **RLVR is one benchmark, one GPU.** The +7 pt result is LIBERO-Spatial with RLinf's own
+  SFT checkpoint; a custom robot/task needs its own simulator env and success check, and
+  the 4-GPU configuration is built (`-c rlMaxvCpus`) but has not run (On-Demand g6e
+  capacity in the two VPC AZs was the blocker).
 - **RL is smoke-verified, not training-verified.** A 100-iteration Batch run produced
   `policy.onnx`, so the path works end to end, but **no full-length RL training run** has
   been done yet — the exported smoke policy is not a usable locomotion policy. Two

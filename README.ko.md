@@ -15,8 +15,9 @@ reinforcement-learning task. `vla-ft`가 GPU 인스턴스를 고르고, job 크�
 끝나면 인프라를 다시 내립니다 — 그래서 남아 도는 GPU도, 기억해야 할 cleanup도 없습니다.
 
 > **상태 요약.** Imitation-learning(IL) 경로는 구현 완료이며, Pattern A(AWS Batch)는
-> 실제 데이터셋으로 end-to-end 검증되었습니다. Reinforcement-learning(RL) 경로는 코드는
-> 완성됐으나 아직 GPU에서 실행하지 않았습니다. [상태](#상태) 섹션에 컴포넌트별 정직한
+> 실제 데이터셋으로 end-to-end 검증되었습니다. Reinforcement-learning(RL) 경로는 GPU 에서
+> smoke 검증됐고, 사전학습된 VLA 의 RL 후학습(RLVR)은 PoC 를 끝까지 돌렸습니다(LIBERO-Spatial
+> 성공률 0.815 → 0.885, GPU 1장). [상태](#상태) 섹션에 컴포넌트별 정직한
 > 내역이 있습니다 — 이 문서는 구현된 것 이상으로 과장하지 않습니다.
 
 ## 아키텍처 한눈에
@@ -212,7 +213,8 @@ pai-training-platform/          (product: vla-ft)
 ├── containers/
 │   ├── vla-ft/                검증된 LeRobot VLA FT 컨테이너 (IL 엔진);
 │   │                            vla_ft_decide / cli + orchestrator plan/submit Lambda 도 포함
-│   └── isaac-lab-rl/          Isaac Lab RL 컨테이너 (rsl_rl 통한 headless PPO)
+│   ├── isaac-lab-rl/          Isaac Lab RL 컨테이너 (rsl_rl 통한 headless PPO)
+│   └── vla-rl/                RLinf 공개 이미지용 RLVR glue (사전학습 pi0/pi0.5 에 PPO)
 ├── mcp/                       선택적 MCP server (구현됨, 7개 툴) — agent session에서 submit / monitor / checkpoint 검증
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
@@ -234,6 +236,14 @@ pai-training-platform/          (product: vla-ft)
   `policy.pt` 와 checkpoint 를 S3 에 올렸습니다. 이것은 파이프라인(배포 → 제출 → 학습 →
   ONNX export → 업로드)이 동작한다는 증거이지 정책 품질의 증거가 아닙니다 — 100 iteration
   은 수렴에 한참 못 미칩니다. full-length reference run 이 RL 의 남은 점검 항목입니다.
+- **VLA RLVR(사전학습 VLA 의 RL 후학습): PoC 검증, 개선 폭은 작음.** 같은 RL Pattern A
+  큐에 두 번째 job definition 을 두고 [RLinf](https://github.com/RLinf/RLinf) v0.3 공개
+  이미지(digest 고정)를 `containers/vla-rl/vla_rl_bootstrap.py`(`inspect` / `eval` /
+  `train`)로 돌립니다. 공개 π0.5 few-shot SFT checkpoint 에 LIBERO-Spatial 에서 PPO, 보상 =
+  task 성공, 120 step × 64 궤적, 1×L40S(g6e.8xlarge On-Demand, 약 16시간, 약 $73): 같은 200개
+  초기 상태에서 성공률 **0.815 → 0.885**(+7.0pt, 단측 Fisher p = 0.034, 짝비교 McNemar
+  p = 0.014). 개선은 가장 약한 task 들에서 나왔고, 미리 정한 +10pt 목표에는 못 미쳤습니다 —
+  RLinf 기본 rollout batch 의 1/8 로 돌린 것이라, 조정할 축은 알고리즘이 아니라 GPU 수입니다.
 
 검증된 것 vs 설계만 된 것의 단계별 내역은 [`docs/ROADMAP.md`](docs/ROADMAP.md) 참고.
 
@@ -277,6 +287,10 @@ capability와 verified는 다르며, 컴포넌트별 전체 내역은 [상태](#
 이 문서는 과장하지 않습니다. 동일한 caveat이
 [`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md)에도 기록돼 있습니다:
 
+- **RLVR 은 benchmark 하나, GPU 1장 결과입니다.** +7pt 는 RLinf 자체 SFT checkpoint 로
+  LIBERO-Spatial 에서 얻은 값입니다. 사용자 로봇/task 는 자체 시뮬레이터 env 와 성공 판정이
+  필요하고, 4-GPU 구성은 만들어 뒀지만(`-c rlMaxvCpus`) 아직 돌리지 않았습니다(VPC 의 AZ 두 곳에
+  On-Demand g6e 용량이 없었습니다).
 - **RL은 smoke 검증, 학습 검증은 아직.** 100 iteration Batch run 이 `policy.onnx` 를
   내놓아 경로가 end-to-end 로 동작함을 보였지만, **full-length RL 학습 run 은 아직 없습니다**
   — smoke 로 export 된 정책은 쓸 수 있는 보행 정책이 아닙니다. 첫 run 들에서 드러난 배포

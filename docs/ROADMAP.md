@@ -183,6 +183,34 @@ real runs pending.***
 - ☐ **Full-length reference run** (e.g. ≥1500 iterations) with a reward curve that shows
   convergence — the smoke proves the pipeline, not policy quality.
 
+- ☑ **VLA RLVR PoC** (2026-10-17/18) — RL post-training of a *pretrained VLA*, not a
+  from-scratch sim policy. A second JobDef (`VlaRlJobDef`) on the same CE/JQ/EFS runs
+  RLinf v0.3's published image (amd64 digest pinned) with `containers/vla-rl/vla_rl_bootstrap.py`
+  (clones RLinf at a pinned SHA + the HF SFT checkpoint onto EFS, runs train/eval with Hydra
+  overrides, uploads the run dir to S3). Setup: π0.5 few-shot SFT
+  (`RLinf/RLinf-Pi05-LIBERO-SFT`) · LIBERO-Spatial · reward = task success · PPO.
+  Eval = RLinf's `evaluations/` entry, n = 200 on fixed reset states.
+
+  | checkpoint | success_once | Δ | Fisher (1-sided) | McNemar (1-sided) |
+  |---|---|---|---|---|
+  | SFT | 0.815 | – | – | – |
+  | step 40 | 0.870 | +5.5 | 0.085 | 0.040 |
+  | step 80 | 0.880 | +6.5 | 0.047 | 0.015 |
+  | **step 120** | **0.885** | **+7.0** | **0.034** | **0.014** |
+
+  1×L40S (g6e.8xlarge On-Demand), 64 trajectories/step, ~16 h, ~$73. Significant, but short
+  of the pre-registered +10 pt; the run used 1/8 of RLinf's default rollout batch.
+  Lessons wired into the bootstrap/docs: eval through `evaluations/eval_embodied_agent.py`
+  (the train config's `only_eval` path reads keys the π0.5 config only sets on `actor.model`);
+  50 EGL-rendered envs OOM a 48 GB GPU next to the policy — 20 fit; do **not** set
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (actor→rollout weight sync over CUDA IPC
+  then needs `pidfd_getfd`, which the container's seccomp denies); evaluating a PPO
+  checkpoint needs `rollout.model.add_value_head=True ++rollout.model.openpi.value_after_vlm=True`
+  so the strict state-dict load matches.
+- ☐ **RLVR at RLinf scale** — 4×L40S g6e.12xlarge (256 trajectories/step) is built
+  (`-c rlInstanceTypes=… -c rlMaxvCpus=64`) but has not run: On-Demand g6e capacity was
+  exhausted in both VPC AZs. Adding subnets in more AZs is the prerequisite.
+
 *Cost: 0 to build; ~$1 per 100-iteration smoke on On-Demand g6e.4xlarge. Gate: a
 reward+task goes in, a trained policy + ONNX comes out. **Pipeline verified; full-length
 run pending.***
@@ -304,6 +332,7 @@ job submitted — no hand-written launcher. **✅ met at the dry-run level; live
 | 2b | IL SM Training Job (B) | real deploy + real fine-tune |
 | 2d | IL GR00T N1.7 (Batch A) | ☑ `cdk synth` 5-stack + jest 87/87 + py guard 15/15; image build + smoke + full G1 FT pending |
 | 3 | RL Batch (A/B) | real deploy + real RL run (1 reference task) |
+| 3 | VLA RLVR (Batch A, RLinf) | ☑ real deploy + PoC: LIBERO-Spatial 0.815 → 0.885 (n=200, p=0.034); 4-GPU run pending |
 | 4 | Orchestrator (Step Functions) | `cdk synth` + jest + py asserts; live IL/RL execution deferred to next GPU spend |
 | 5 | HyperPod (C, IL & RL) | `cdk synth` only — real deploy deferred |
 | 6 | Launcher UX (Ease/Efficiency) | ☑ `test_vla_ft_decide.py` 30/30 + real dry-run vs live CFN; live `--yes` submit pending |
