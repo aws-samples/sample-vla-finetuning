@@ -10,6 +10,7 @@ for t in \
   containers/vla-ft/test_train_resume.py \
   containers/vla-ft/test_dcp_checkpoint.py \
   containers/isaac-lab-rl/test_rl_liveness_guard.py \
+  containers/vla-rl/test_vla_rl_launch.py \
   containers/gr00t-n17/test_gr00t_liveness_guard.py \
   containers/gr00t-n17/docker/test_gr00t_awr_resample.py \
   mcp/test_mcp.py; do

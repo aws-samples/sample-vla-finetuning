@@ -107,6 +107,15 @@ python vla_ft_cli.py --quickstart --yes
 # 2. RL: task id 로부터 sim 정책 학습 (Isaac Lab headless PPO on Batch)
 python vla_ft_cli.py --intent rl --task Isaac-Velocity-Rough-H1-v0 \
     --max-iterations 3000 --num-envs 4096 --dry-run
+
+# 3. RLVR: 사전학습 pi0.5 를 PPO 로 후학습, 보상 = task 성공 (LIBERO)
+#    SFT checkpoint 평가 -> 학습 -> PPO checkpoint 평가 -> 비교
+cd ../vla-rl
+python vla_rl_launch.py eval  --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_launch.py train --steps 60 --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_launch.py eval  --from-run <train job id> --step 60 \
+    --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_compare.py <sft eval job id> <step-60 eval job id>   # Fisher + 짝비교 McNemar
 ```
 
 해석된 계획 예시 (`--quickstart --dry-run`):
@@ -214,7 +223,7 @@ pai-training-platform/          (product: vla-ft)
 │   ├── vla-ft/                검증된 LeRobot VLA FT 컨테이너 (IL 엔진);
 │   │                            vla_ft_decide / cli + orchestrator plan/submit Lambda 도 포함
 │   ├── isaac-lab-rl/          Isaac Lab RL 컨테이너 (rsl_rl 통한 headless PPO)
-│   └── vla-rl/                RLinf 공개 이미지용 RLVR glue (사전학습 pi0/pi0.5 에 PPO)
+│   └── vla-rl/                RLinf 공개 이미지 기반 RLVR: bootstrap · launcher · 평가 비교
 ├── mcp/                       선택적 MCP server (구현됨, 7개 툴) — agent session에서 submit / monitor / checkpoint 검증
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```

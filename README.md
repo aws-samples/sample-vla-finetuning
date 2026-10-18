@@ -112,6 +112,15 @@ python vla_ft_cli.py --quickstart --yes
 # 2. RL: a sim policy from a task id (Isaac Lab headless PPO on Batch)
 python vla_ft_cli.py --intent rl --task Isaac-Velocity-Rough-H1-v0 \
     --max-iterations 3000 --num-envs 4096 --dry-run
+
+# 3. RLVR: post-train a pretrained pi0.5 with PPO, reward = task success (LIBERO)
+#    eval the SFT checkpoint -> train -> eval the PPO checkpoint -> compare
+cd ../vla-rl
+python vla_rl_launch.py eval  --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_launch.py train --steps 60 --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_launch.py eval  --from-run <train job id> --step 60 \
+    --stack PaiTrainingPlatform-RL-PatternA --yes
+python vla_rl_compare.py <sft eval job id> <step-60 eval job id>   # Fisher + paired McNemar
 ```
 
 Example resolved plan (`--quickstart --dry-run`):
@@ -219,7 +228,7 @@ pai-training-platform/          (product: vla-ft)
 │   ├── vla-ft/                the verified LeRobot VLA FT container (the IL engine);
 │   │                            also holds vla_ft_decide / cli + orchestrator plan/submit Lambdas
 │   ├── isaac-lab-rl/          Isaac Lab RL container (headless PPO via rsl_rl)
-│   └── vla-rl/                RLVR glue for RLinf's published image (PPO on a pretrained pi0/pi0.5)
+│   └── vla-rl/                RLVR on RLinf's published image: bootstrap · launcher · eval compare
 ├── mcp/                       optional MCP server (built, 7 tools) — submit / monitor / checkpoint-verify from an agent session
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
