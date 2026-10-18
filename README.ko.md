@@ -224,7 +224,7 @@ pai-training-platform/          (product: vla-ft)
 │   │                            vla_ft_decide / cli + orchestrator plan/submit Lambda 도 포함
 │   ├── isaac-lab-rl/          Isaac Lab RL 컨테이너 (rsl_rl 통한 headless PPO)
 │   └── vla-rl/                RLinf 공개 이미지 기반 RLVR: bootstrap · launcher · 평가 비교
-├── mcp/                       선택적 MCP server (구현됨, 7개 툴) — agent session에서 submit / monitor / checkpoint 검증
+├── mcp/                       선택적 MCP server (구현됨, 9개 툴) — agent session에서 submit / monitor / checkpoint 검증
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
 
@@ -325,9 +325,9 @@ capability와 verified는 다르며, 컴포넌트별 전체 내역은 [상태](#
   핵심 결정.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — 단계별 빌드 계획과 단계별 검증 수준.
 - [`docs/MCP-DESIGN.md`](docs/MCP-DESIGN.md) — 선택적 MCP server 설계 근거.
-  server는 **구현 + live 검증 완료**(v1, 7개 툴 — `submit_finetune`,
+  server는 **구현 + live 검증 완료**(v1, 9개 툴 — `submit_finetune`,
   `get_job_status`("정말 학습 중인가?"), `describe_checkpoint`(export consistency gate),
-  `list/get_job`, `register/list_checkpoints`); as-built surface와 등록 방법은
+  `list/get_job`, `register/list_checkpoints`, RLVR 용 `submit_rlvr` / `compare_evals`); as-built surface와 등록 방법은
   [`mcp/README.md`](mcp/README.md) 참고.
 
 ## 네이밍

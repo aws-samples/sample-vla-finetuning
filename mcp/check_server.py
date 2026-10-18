@@ -17,6 +17,8 @@ EXPECTED = {
     "list_my_jobs",
     "register_checkpoint",
     "submit_finetune",
+    "submit_rlvr",
+    "compare_evals",
 }
 
 

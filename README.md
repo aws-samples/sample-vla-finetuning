@@ -229,7 +229,7 @@ pai-training-platform/          (product: vla-ft)
 │   │                            also holds vla_ft_decide / cli + orchestrator plan/submit Lambdas
 │   ├── isaac-lab-rl/          Isaac Lab RL container (headless PPO via rsl_rl)
 │   └── vla-rl/                RLVR on RLinf's published image: bootstrap · launcher · eval compare
-├── mcp/                       optional MCP server (built, 7 tools) — submit / monitor / checkpoint-verify from an agent session
+├── mcp/                       optional MCP server (built, 9 tools) — submit / monitor / checkpoint-verify from an agent session
 └── docs/                      ARCHITECTURE.md · ROADMAP.md · MCP-DESIGN.md
 ```
 
@@ -340,9 +340,10 @@ This README does not oversell. The same caveats are tracked in
   ingest, the asset-reuse map, prior-art differentiation, and key decisions.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased build plan and per-phase verification level.
 - [`docs/MCP-DESIGN.md`](docs/MCP-DESIGN.md) — the optional MCP server design rationale.
-  The server is **built and live-verified** (v1, 7 tools — `submit_finetune`,
+  The server is **built and live-verified** (v1, 9 tools — `submit_finetune`,
   `get_job_status` ("is it *really* learning?"), `describe_checkpoint` (export-consistency
-  gate), `list/get_job`, `register/list_checkpoints`); see [`mcp/README.md`](mcp/README.md)
+  gate), `list/get_job`, `register/list_checkpoints`, and the RLVR pair
+  `submit_rlvr` / `compare_evals`); see [`mcp/README.md`](mcp/README.md)
   for the as-built surface and how to register it.
 
 ## Naming

@@ -19,6 +19,7 @@ not a rewrite:
 Stack output keys (verified against vla_ft_cli.py's resolver):
   IL Pattern A : PaiTrainingPlatform-IL-PatternA       → JobQueueArn JobQueueArnOnDemand JobDefinitionArn CodeS3Hint OutputS3Hint
   RL Pattern A : PaiTrainingPlatform-RL-PatternA       → JobQueueArn JobDefinitionArn OutputS3Hint
+                                                         VlaRlJobDefinitionArn (RLVR)
   GR00T Ptn A  : PaiTrainingPlatform-IL-GrootPatternA  → JobQueueArn JobDefinitionArn OutputS3Hint
   Pattern B    : PaiTrainingPlatform-IL-PatternB       → ExecutionRoleArn ImageUriHint OutputS3Hint
 """
@@ -39,6 +40,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _CORE = os.path.normpath(os.path.join(_HERE, "..", "containers", "vla-ft"))
 if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
+# The RLVR launcher / eval comparison (containers/vla-rl/) — same rule, reused not copied.
+_VLA_RL = os.path.normpath(os.path.join(_HERE, "..", "containers", "vla-rl"))
+if _VLA_RL not in sys.path:
+    sys.path.insert(0, _VLA_RL)
 
 DEFAULT_REGION = "us-west-2"
 # Gated PaliGemma backbone (pi05/GR00T) HF token. The token is read on the SUBMITTING
@@ -233,9 +238,14 @@ def job_facts(job: dict) -> dict:
         elapsed_s = None
     container = job.get("container", {}) or {}
     env = {e["name"]: e.get("value") for e in container.get("environment", []) or []}
-    # The three engines name their output prefix differently (VLA_FT_/RL_/GROOT_).
+    # The engines name their output prefix differently (VLA_FT_/RL_/GROOT_/VRL_).
     out_base = (env.get("VLA_FT_OUTPUT_S3") or env.get("RL_OUTPUT_S3")
                 or env.get("GROOT_OUTPUT_S3") or "")
+    out = out_base + ("/output/" if out_base else "")
+    if not out_base and env.get("VRL_OUTPUT_S3"):
+        # vla_rl_bootstrap.py uploads the run's log dir to <VRL_OUTPUT_S3>/<run name>/.
+        run = env.get("VRL_RUN_NAME") or job.get("jobId", "")
+        out = f"{env['VRL_OUTPUT_S3'].rstrip('/')}/{run}/"
     return {
         "job_name": job.get("jobName", ""),
         "job_id": job.get("jobId", ""),
@@ -243,7 +253,7 @@ def job_facts(job: dict) -> dict:
         "elapsed_s": elapsed_s,
         "log_stream": container.get("logStreamName"),
         "status_reason": job.get("statusReason"),
-        "output_s3": out_base + ("/output/" if out_base else ""),
+        "output_s3": out,
         "liveness_deadline_s": _int_or_none(env.get("RL_LIVENESS_DEADLINE_S")
                                             or env.get("VLA_FT_LIVENESS_DEADLINE_S")
                                             or env.get("GROOT_LIVENESS_DEADLINE_S")),
@@ -366,3 +376,18 @@ def _int_or_none(v) -> int | None:
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def submit_rlvr(sess: boto3.Session, name: str, container: dict, timeout_s: int) -> dict:
+    """Submit a vla_rl_launch.build_plan() result to the RL Pattern A queue + VlaRlJobDef."""
+    outs = stack_outputs(sess, STACK_RL_A)
+    queue, jobdef = outs.get("JobQueueArn"), outs.get("VlaRlJobDefinitionArn")
+    if not queue or not jobdef:
+        return {"status": "error",
+                "error": f"{STACK_RL_A} has no JobQueueArn / VlaRlJobDefinitionArn output "
+                         "(deploy the RL Pattern A stack with the VLA RLVR job definition)"}
+    resp = sess.client("batch").submit_job(
+        jobName=name, jobQueue=queue, jobDefinition=jobdef,
+        containerOverrides=container, timeout={"attemptDurationSeconds": timeout_s})
+    return {"status": "submitted", "job_id": resp["jobId"], "job_name": name,
+            "job_queue": queue, "job_definition": jobdef}

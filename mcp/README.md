@@ -28,6 +28,10 @@ and picks the engine + backend:
   UNITREE_G1 auto-sets `action_horizon=50` (avoids the 40/50 step-0 crash).
 - **RL** — `task` (an Isaac Lab task id), `intent='rl'` → Batch (RL A).
 
+RL post-training of a *pretrained VLA* (RLVR, RLinf PPO on pi0.5 in LIBERO) has its own
+pair of tools, `submit_rlvr` + `compare_evals`, because its loop is eval → train → eval →
+compare rather than one submit.
+
 | Tool | The requester's question | Returns |
 |---|---|---|
 | `submit_finetune` | "start the FT, pick the engine + backend for me" | resolved plan (engine/backend/instance/**cost**) + `job_id` + the **output S3 prefix** it writes to. Routes lerobot · GR00T · RL. `dry_run=True` by default (plan only, no launch, no creds). `image_uri` pins the container to an exact image (digest) — drift guard against a `:latest` rebuild changing the image under a run (honored on the SageMaker path; advisory on Batch). |
@@ -36,6 +40,8 @@ and picks the engine + backend:
 | `get_job` | "what config + which image did I run?" | resolved model/dataset/steps/ft-mode/horizon/output from the job's env, plus `image_uri` and the digest it resolves to **now** (`image_digest`) — compare across two runs of the same tag to catch `:latest` drift. |
 | `describe_checkpoint` | "give me a checkpoint I can load — is it internally consistent?" | `kind, consistency (OK\|MISMATCH\|UNKNOWN), adapter_only, base_model, model_action_horizon, processor_action_horizon, files, loadable_hint`. **The GR00T 40/50 horizon gate.** |
 | `register_checkpoint` / `list_checkpoints` | "remember what I trained / which are validated" | S3-manifest registry, idempotent by job name. |
+| `submit_rlvr` | "post-train this VLA with RL, reward = task success" | the plan from `containers/vla-rl/vla_rl_launch.py` (defaults = the LIBERO-Spatial PoC settings) and, with `dry_run=False`, the Batch `job_id`. `mode` = `eval` (SFT or `from_run`+`step` checkpoint, n=200 fixed reset states) · `train` (`steps`, `num_gpus`, `resume_run`+`resume_step`) · `inspect`. Bad argument combinations come back as `error`, nothing launched. |
+| `compare_evals` | "did RL help?" | for two eval job ids: success before/after, delta, fail→success / success→fail pairs, one-sided Fisher and paired McNemar p, per-task counts. Reads the jobs' CloudWatch eval lines. |
 
 ## The two payoffs, verified against live AWS (2026-06-20)
 
@@ -95,7 +101,7 @@ and picks the engine + backend:
 
 ```
 mcp/
-  server.py          FastMCP server — the 7 tools (thin wiring only)
+  server.py          FastMCP server — the 9 tools (thin wiring only)
   vla_status.py      pure: progress regexes + the RUNNING≠learning verdict
   vla_checkpoint.py  pure: adapter/merged classify + GR00T horizon consistency gate
   vla_registry.py    pure: S3-manifest schema (upsert/query)

@@ -15,14 +15,17 @@ Design rules honored here:
   - **Enriched status, not raw Batch state** — get_job_status answers "RUNNING != learning"
     in one call.
 
-Tools (the requester's four questions + a registry):
+Tools (the requester's four questions + a registry + the RLVR loop):
   submit_finetune · get_job_status · list_my_jobs · get_job ·
-  describe_checkpoint · register_checkpoint · list_checkpoints
+  describe_checkpoint · register_checkpoint · list_checkpoints ·
+  submit_rlvr · compare_evals
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 
 from mcp.server.fastmcp import FastMCP
 
@@ -30,6 +33,8 @@ import vla_aws as aws
 import vla_status as status
 import vla_checkpoint as ckpt
 import vla_registry as reg
+import vla_rl_compare  # containers/vla-rl/ (put on sys.path by vla_aws)
+import vla_rl_launch
 
 mcp = FastMCP("vla-ft")
 
@@ -553,6 +558,110 @@ def list_checkpoints(
                      consistency=consistency)
     return {"registry": f"{registry_uri}/{reg.REGISTRY_KEY}", "count": len(rows),
             "checkpoints": rows}
+
+
+# ── 8. submit_rlvr ───────────────────────────────────────────────────────────────────
+def _rlvr_argv(mode, steps, num_gpus, from_run, step, resume_run, resume_step, episodes,
+               model_repo, overrides, job_name, timeout_hours) -> list[str]:
+    argv = [mode]
+    for flag, val in (("--steps", steps), ("--num-gpus", num_gpus), ("--from-run", from_run),
+                      ("--step", step), ("--resume-run", resume_run),
+                      ("--resume-step", resume_step), ("--episodes", episodes),
+                      ("--model-repo", model_repo), ("--job-name", job_name),
+                      ("--timeout-hours", timeout_hours)):
+        if val is not None:
+            argv += [flag, str(val)]
+    for o in overrides or []:
+        argv += ["--override", o]
+    return argv
+
+
+@mcp.tool()
+def submit_rlvr(
+    mode: str = "eval",
+    steps: int | None = None,
+    num_gpus: int | None = None,
+    from_run: str | None = None,
+    step: int | None = None,
+    resume_run: str | None = None,
+    resume_step: int | None = None,
+    episodes: int | None = None,
+    model_repo: str | None = None,
+    overrides: list[str] | None = None,
+    job_name: str | None = None,
+    timeout_hours: float | None = None,
+    region: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """RL post-training of a pretrained VLA (RLVR): RLinf PPO on pi0.5 in LIBERO, reward =
+    task success. Same plan as containers/vla-rl/vla_rl_launch.py (its defaults are the
+    settings the LIBERO-Spatial PoC ran with: 0.815 -> 0.885 on 1x L40S).
+
+    The loop, one call each:
+      1. mode='eval'                                    — the SFT checkpoint, n=200
+      2. mode='train', steps=60                         — PPO, ~8 min/step on 1 GPU
+      3. mode='eval', from_run=<train job id>, step=60  — the PPO checkpoint, same 200 states
+      4. compare_evals(<job 1>, <job 3>)                — is it better?
+    Continue a run: mode='train', resume_run=<job id>, resume_step=60, steps=120 (total).
+    num_gpus=4 scales envs and batch for g6e.12xlarge. mode='inspect' prints image facts.
+
+    dry_run=True (default) returns the plan and launches nothing; dry_run=False submits
+    (GPU cost) to the RL Pattern A queue with the VlaRlJobDefinition."""
+    argv = _rlvr_argv(mode, steps, num_gpus, from_run, step, resume_run, resume_step,
+                      episodes, model_repo, overrides, job_name, timeout_hours)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):  # argparse errors go to stderr, then exit
+            args = vla_rl_launch.parse_args(argv)
+    except SystemExit:
+        msg = (err.getvalue().strip().splitlines() or ["invalid arguments"])[-1]
+        return {"submitted": False, "error": msg.split("error: ", 1)[-1], "argv": argv}
+    name, container, timeout_s = vla_rl_launch.build_plan(args)
+    plan = {"job_name": name, "mode": mode, "container_overrides": container,
+            "timeout_s": timeout_s}
+    if mode == "train":
+        todo = args.steps - (args.resume_step if args.resume_run else 0)
+        plan["estimate_hours_1gpu"] = round(todo * vla_rl_launch.MINUTES_PER_STEP_1GPU / 60, 1)
+    if dry_run:
+        return {"submitted": False, "dry_run": True, "plan": plan,
+                "note": "dry_run=True — nothing launched. Re-call with dry_run=False to submit "
+                        "(GPU cost)."}
+    sess = aws.session(region)
+    try:
+        result = aws.submit_rlvr(sess, name, container, timeout_s)
+    except RuntimeError as e:
+        return {"submitted": False, "error": str(e), "plan": plan}
+    result["submitted"] = result.get("status") == "submitted"
+    result["plan"] = plan
+    if mode == "train" and result["submitted"]:
+        result["next"] = (f"submit_rlvr(mode='eval', from_run='{result['job_id']}', "
+                          f"step=<a saved step>) once get_job_status shows it SUCCEEDED")
+    return result
+
+
+# ── 9. compare_evals ─────────────────────────────────────────────────────────────────
+@mcp.tool()
+def compare_evals(before_job_id: str, after_job_id: str, region: str | None = None) -> dict:
+    """Did RLVR help? Compare two submit_rlvr(mode='eval') jobs over the same fixed reset
+    states: success rates, one-sided Fisher exact and paired McNemar exact p-values, and
+    per-task counts. Reads each job's '[libero eval] task_id=…, success=…' log lines."""
+    try:
+        before = vla_rl_compare.load(before_job_id, region or aws.DEFAULT_REGION)
+        after = vla_rl_compare.load(after_job_id, region or aws.DEFAULT_REGION)
+        r = vla_rl_compare.compare(before, after)
+    except (SystemExit, ValueError) as e:
+        return {"error": str(e)}
+    n = r["n"]
+    return {
+        "n_paired": n, "unpaired_dropped": r["unpaired"],
+        "success_before": round(r["before"] / n, 4), "success_after": round(r["after"] / n, 4),
+        "delta_pt": round(100 * (r["after"] - r["before"]) / n, 1),
+        "fail_to_success": r["gained"], "success_to_fail": r["lost"],
+        "fisher_p_one_sided": round(r["fisher_p"], 4),
+        "mcnemar_p_one_sided": round(r["mcnemar_p"], 4),
+        "per_task": {str(t): {"before": b, "after": a, "trials": k}
+                     for t, (b, a, k) in r["per_task"].items()},
+    }
 
 
 if __name__ == "__main__":

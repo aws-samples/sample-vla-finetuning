@@ -1,6 +1,7 @@
 # vla-ft MCP — self-serve VLA fine-tuning for requesting CC sessions
 
-**Status**: **v1 built & live-verified** (2026-06-20) — 7 tools in [`../mcp/`](../mcp/),
+**Status**: **v1 built & live-verified** (2026-06-20) — 7 tools in [`../mcp/`](../mcp/)
+(+ `submit_rlvr` / `compare_evals` for the RLVR loop, 2026-10-18 — 9 in total),
 `test_mcp.py` 43/43, verified against a live RUNNING job and the real GR00T checkpoint gate.
 See [`../mcp/README.md`](../mcp/README.md) for the as-built surface. This doc is the
 *design rationale*; the sections below describe the design as decided, and the

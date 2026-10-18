@@ -37,14 +37,17 @@ from dataclasses import dataclass, field
 
 # ── engine detection (by the launcher's job-name prefix) ─────────────────────────────
 def classify_engine(job_name: str) -> str:
-    """Map a job name to its log dialect: 'lerobot' | 'gr00t' | 'rl'.
+    """Map a job name to its log dialect: 'lerobot' | 'gr00t' | 'rl' | 'vla-rl'.
 
     The prefixes are the launchers' own convention (batch_launch.py / gr00t_launch.py /
-    rl_launch.py): vla-ft- → lerobot, gr00t-n17- → gr00t, isaac-rl- → rl. Unknown →
-    'lerobot' (the most common case here), so enrichment degrades gracefully."""
+    rl_launch.py / vla_rl_launch.py): vla-ft- → lerobot, gr00t-n17- → gr00t, isaac-rl- →
+    rl, vla-rl- → vla-rl (RLinf). Unknown → 'lerobot' (the most common case here), so
+    enrichment degrades gracefully."""
     n = (job_name or "").lower()
     if n.startswith("gr00t"):
         return "gr00t"
+    if n.startswith("vla-rl"):
+        return "vla-rl"
     if n.startswith("isaac-rl") or n.startswith("rl-"):
         return "rl"
     return "lerobot"
@@ -65,6 +68,10 @@ _GROOT_EPOCH = re.compile(r"'epoch':\s*([\d.]+)")
 # RL rsl_rl iteration marker (may be preceded by ANSI/centering codes → not anchored).
 _RL_ITER = re.compile(r"Learning iteration\s+(\d+)/(\d+)")
 _RL_REWARD = re.compile(r"Mean reward:\s*([\-\d.]+)")
+# vla-rl (RLinf): the runner's progress box prints "│ Global Step:   88/120 │" after each
+# PPO step (~8 min apart on 1 GPU); an eval prints one line per finished episode.
+_RLINF_STEP = re.compile(r"Global Step:\s*(\d+)/(\d+)")
+_RLINF_EPISODE = re.compile(r"\[libero eval\] task_id=\d+, trial_id=\d+, success=(True|False)")
 
 # GPU telemetry line (train.py's start_gpu_telemetry, the DCGM-pattern signal on the
 # CloudWatch channel): "[gpu-telemetry] gpus=4 util_mean=86% util_min=83% mem_used=...
@@ -153,6 +160,18 @@ def parse_progress(log_tail: str, engine: str) -> Progress:
         if not _GROOT_LIVE.search(log_tail):
             p.saw_progress_line = p.saw_progress_line and False
         else:
+            p.saw_progress_line = True
+        return p
+
+    if engine == "vla-rl":
+        last = None
+        for m in _RLINF_STEP.finditer(log_tail):
+            last = m
+        if last:
+            p.latest_step = int(last.group(1))
+            p.total_steps = int(last.group(2))
+            p.saw_progress_line = True
+        elif _RLINF_EPISODE.search(log_tail):
             p.saw_progress_line = True
         return p
 

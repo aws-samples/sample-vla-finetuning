@@ -407,5 +407,35 @@ check(aws.resolve_image_digest(_FakeSession(ecr3),
       "ECR describe error → None (degrades, never raises)")
 
 
+# ── vla-rl (RLinf RLVR) jobs: engine, progress, output prefix (REAL log lines 2026-10-18) ─
+print("vla-rl engine:")
+check(st.classify_engine("vla-rl-train-1gpu-20261017-1036") == "vla-rl", "vla-rl- -> vla-rl")
+check(st.classify_engine("vla-rl-eval-step120-20261018-0422") == "vla-rl", "vla-rl eval -> vla-rl")
+RLINF_STEP = ("\u2502 Global Step:   88/120 \u2502 Progress: \u2588\u2588\u2588 \u2502  73.3%  \u2502")
+pv = st.parse_progress(RLINF_STEP, "vla-rl")
+check(pv.saw_progress_line and pv.latest_step == 88 and pv.total_steps == 120,
+      f"RLinf Global Step 88/120 parsed (got {pv.latest_step}/{pv.total_steps})")
+EVAL_LINE = ("\x1b[36m(EnvGroup(rank=0) pid=1763)\x1b[0m [INFO 04:41:30 EnvGroup-Rank-0]"
+             "[utils.py:264] [libero eval] task_id=0, trial_id=0, success=True")
+check(st.parse_progress(EVAL_LINE, "vla-rl").saw_progress_line, "eval episode line -> progress")
+check(not st.parse_progress("[vla-rl] mode=train cache=/mnt/efs/vla-rl", "vla-rl").saw_progress_line,
+      "bootstrap banner -> no progress")
+f_vrl = aws.job_facts({"jobName": "vla-rl-eval-sft-x", "jobId": "j1", "status": "SUCCEEDED",
+                       "container": {"environment": [
+                           {"name": "VRL_OUTPUT_S3", "value": "s3://b/vla-rl/"},
+                           {"name": "VRL_RUN_NAME", "value": "vla-rl-eval-sft-x"}]}})
+check(f_vrl["output_s3"] == "s3://b/vla-rl/vla-rl-eval-sft-x/",
+      f"VRL output prefix = <VRL_OUTPUT_S3>/<run>/ (got {f_vrl['output_s3']})")
+f_rl = aws.job_facts({"jobName": "isaac-rl-x", "container": {"environment": [
+    {"name": "RL_OUTPUT_S3", "value": "s3://b/isaac-rl/isaac-rl-x"}]}})
+check(f_rl["output_s3"] == "s3://b/isaac-rl/isaac-rl-x/output/", "RL output prefix unchanged")
+
+# submit_rlvr reuses the launcher's plan (importable via vla_aws's sys.path entry).
+import vla_rl_launch as vrl  # noqa: E402
+_n, _c, _t = vrl.build_plan(vrl.parse_args(["eval", "--from-run", "J", "--step", "60"]))
+_ov = {e["name"]: e["value"] for e in _c["environment"]}["VRL_OVERRIDES"].split()
+check("rollout.model.add_value_head=True" in _ov, "launcher importable from mcp/ + value head on ckpt eval")
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
