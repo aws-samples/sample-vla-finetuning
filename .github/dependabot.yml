@@ -26,8 +26,10 @@ updates:
         patterns: ["*"]
     ignore:
       # server.py is written against mcp 1.x (FastMCP); 2.x needs a code migration.
+      # A version range, not update-types: requirements.txt pins a range (>=1.2,<2), and
+      # dependabot widens a range to admit 2.x even with a semver-major ignore (PR #12).
       - dependency-name: mcp
-        update-types: ["version-update:semver-major"]
+        versions: [">=2"]
 
   - package-ecosystem: github-actions
     directory: /
