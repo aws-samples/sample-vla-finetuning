@@ -1,0 +1,70 @@
+# EXPERIMENTAL — AWS Trainium (Trn2/Trn3) image for vla-ft via TorchNeuron.
+#
+# TorchNeuron = torch-neuronx >= 2.14, a native PyTorch backend that registers the
+# "neuron" device (Beta, Neuron SDK 2.33, announced 2026-10). Trn1/Inferentia are NOT
+# supported by it. train.py selects it with the `device=neuron` hyperparameter; the
+# CUDA image (Dockerfile) stays the verified default.
+#
+# Differences from the CUDA image:
+#   - torch 2.14.0 (CPU wheel) + torch-neuronx 2.14.* + neuronx-cc + nki, as the
+#     torch-neuronx README pins them. torchvision/torchcodec are re-pinned to the
+#     releases built against torch 2.14 (their C++ ABI is tied to the torch version —
+#     see the torchcodec note in Dockerfile).
+#   - lerobot at the SAME commit as the CUDA image, installed with an override on
+#     torch/torchvision: lerobot caps torch<2.12, so a plain resolve refuses 2.14.
+#     Running it on 2.14 is exactly what the PoC must prove.
+#   - The Neuron driver (aws-neuronx-dkms) lives on the HOST (Neuron DLAMI); the
+#     container only needs the runtime + tools from the Neuron apt repo.
+# Build on x86_64 (torch-neuronx publishes x86_64 wheels only).
+# Ubuntu 26.04, NOT 24.04: the torch-neuronx 2.14 wheel is tagged plain linux_x86_64
+# (no manylinux) and its _C.so needs GLIBC_2.43 — on 24.04 (glibc 2.39) `import torch`
+# itself fails (torch auto-loads the neuron backend). Observed in CodeBuild 2026-10-25,
+# although the README lists 22.04/24.04. Python 3.12 comes from uv (26.04 ships 3.14).
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg build-essential \
+    libarchive13t64 git git-lfs ffmpeg libsm6 libxext6 libgl1 libglx-mesa0 libglib2.0-0 \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv venv --seed -p 3.12 /opt/venv
+ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:${PATH}
+
+# Neuron runtime + tools (neuron-ls / neuron-top) from the Neuron apt repo.
+RUN . /etc/os-release && \
+    echo "deb [signed-by=/usr/share/keyrings/neuron.gpg] https://apt.repos.neuron.amazonaws.com ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/neuron.list && \
+    curl -fsSL https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | gpg --dearmor -o /usr/share/keyrings/neuron.gpg && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      aws-neuronx-collectives aws-neuronx-runtime-lib aws-neuronx-tools && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH=/opt/aws/neuron/bin:${PATH}
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN pip install --no-cache-dir torch==2.14.0 torchvision==0.29.1 \
+    --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir "torch-neuronx==2.14.*" "neuronx-cc==2.*" "nki>=0.6" \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+RUN pip install --no-cache-dir torchcodec
+RUN pip install --no-cache-dir sagemaker-training
+
+# lerobot pins torch<2.12; the override keeps the torch 2.14 installed above.
+RUN printf 'torch==2.14.0\ntorchvision==0.29.1\n' > /tmp/override.txt && \
+    uv pip install --no-cache --override /tmp/override.txt \
+      "lerobot[training,peft,smolvla] @ git+https://github.com/huggingface/lerobot.git@d1b1c5c8" \
+      --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "import torch, lerobot, importlib.metadata as m; print('torch', torch.__version__, 'torch-neuronx', m.version('torch-neuronx'), 'lerobot', m.version('lerobot'))"
+
+# Build-time gate: torchcodec must load against torch 2.14 + the image FFmpeg and
+# round-trip a clip (its C++ ABI is tied to torch — a mismatch fails HERE, not mid-job).
+# torch auto-loads the neuron backend, which needs a Neuron device — CodeBuild has none, so
+# build-time checks disable the autoload. On a Trn host the backend loads normally.
+RUN TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "import torch; from torchcodec.encoders import VideoEncoder; from torchcodec.decoders import VideoDecoder; VideoEncoder(torch.randint(0,255,(8,3,64,64),dtype=torch.uint8), frame_rate=10).to_file('/tmp/c.mp4'); print('torchcodec decode', tuple(VideoDecoder('/tmp/c.mp4')[0].shape))" && rm -f /tmp/c.mp4
+
+ENV WANDB_MODE=offline
+ENV PYTHONUNBUFFERED=1
+# Compile cache on the job's scratch so retries skip neuronx-cc recompiles.
+ENV NEURON_COMPILE_CACHE_URL=/opt/ml/checkpoints/neuron-cache
+# Same as the CUDA image: no COPY of train.py — launch.py ships src/ as source_dir.

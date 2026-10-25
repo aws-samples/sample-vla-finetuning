@@ -18,6 +18,7 @@ stack.
 |---|---|---|
 | `docker/Dockerfile` | **byte-identical** (sha256 verified) | the verified stack/lock; do not edit |
 | `src/train.py` | **diverged** (early-stop layer added) | multi-policy + multi-GPU **+ opt-in early-stop / overfit guard** (see below). Default path (no early-stop flags) is behaviorally identical to the verified smoke. source_dir → no rebuild. |
+| `docker/Dockerfile.neuron` | **new · experimental** | AWS Trainium (Trn2/Trn3) image via TorchNeuron (torch-neuronx 2.14). Not built or run in CI; see "Trainium (experimental)" below. |
 | `launch.py` | **diverged** | platform binding (`--image-uri/--role/--output-s3`) + `--val-episodes/--select-best/--early-stop-*` flags |
 | `build.sh` | **generalized** | default repo `pai/vla-ft` (was flat `vla-ft`); slash-safe IAM/CodeBuild names |
 
@@ -191,3 +192,33 @@ s3://<output>/<job>/output/model.tar.gz   # final LeRobot pretrained_model/
 
 `vla-hub`'s `serve.py` loads from `MODEL_CHECKPOINT_DIR`, so serving a fine-tuned
 policy is mount + env override — no serve.py change.
+
+## Trainium (experimental)
+
+`train.py` accepts a `device` hyperparameter: `cuda` (default, the verified path) |
+`neuron` | `cpu` | `auto`. `neuron` targets AWS Trainium through TorchNeuron
+(torch-neuronx >= 2.14, Trn2/Trn3 only, Beta) and needs the image built from
+`docker/Dockerfile.neuron`. `num_gpus=N` with `device=neuron` means N NeuronCores on one
+node: `train.py` starts `torchrun --standalone --nproc_per_node=N -m neuron_shim`, accelerate
+(>= 1.15) picks `MULTI_NEURON` with the `neuron` torch.distributed backend, and each rank is
+pinned to its `LOCAL_RANK` core. Multi-node neuron is refused. The held-out validation pass
+still runs on CUDA/CPU. The container needs `--ulimit memlock=-1 --cap-add IPC_LOCK`
+(otherwise "Failed to copy data to Neuron device").
+
+Measured 2026-10-25 (SmolVLA from `lerobot/smolvla_base`, `lerobot/svla_so100_pickplace`,
+batch 8 per device, eager mode, steady state after the first-step compile of ~110 s):
+
+| Setup | Effective batch | step/s | samples/s | Final loss |
+|---|---|---|---|---|
+| g6e.4xlarge (1x L40S, cuda) | 8 | 5.2 | ~42 | ~0.14 (1000 steps) |
+| trn2.48xlarge, 1 NeuronCore | 8 | 1.05 | ~8 | 0.137 (1000 steps) |
+| trn2.48xlarge, 8 NeuronCores | 64 | ~0.94 | ~60 | 0.143 (300 steps) |
+| trn2.48xlarge, 64 NeuronCores | 512 | ~0.75 | ~380 | 0.135 (300 steps) |
+
+Loss curves match the CUDA run. Cost per 1M samples, using the Capacity Block price
+paid ($858.26 / 24 h) and g6e.4xlarge on-demand ($3.00/h): Trainium 64 cores ~$26,
+L40S ~$20 (the GPU run at batch 8 may not saturate the L40S). Trainium is ~9x faster
+in wall time. Known risks: lerobot caps `torch<2.12` (the Neuron image overrides it to
+2.14), `torch.compile` on Neuron needs static shapes, and ops without a Neuron lowering
+fall back to CPU with only a warning.
+Unit test: `python3 test_train_device.py`.

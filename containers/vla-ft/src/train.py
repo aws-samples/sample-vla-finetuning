@@ -135,6 +135,7 @@ CONSUMED_KEYS = {
     "job_name",
     "resume",
     "num_gpus",
+    "device",
     "val_episodes",
     "select_best",
     "early_stop_patience",
@@ -304,6 +305,37 @@ def resolve_num_gpus(hp):
         return 1
 
 
+def resolve_device(hp):
+    """Training accelerator for lerobot's --policy.device.
+
+    `device` hyperparameter: cuda (default — the verified path) | neuron | cpu | auto.
+    `neuron` = AWS Trainium via TorchNeuron (torch-neuronx >= 2.14, Trn2/Trn3 only,
+    PyTorch device string "neuron"). It is EXPERIMENTAL here: single process only
+    (no accelerate multi-GPU / FSDP launcher), and it requires the Neuron image
+    (docker/Dockerfile.neuron). `auto` picks neuron only when torch_neuronx is
+    importable AND a neuron device is visible, else cuda if available, else cpu.
+    Raises ValueError on an unknown value so a typo never silently trains on CPU."""
+    want = str(hp.get("device", "cuda")).strip().lower()
+    if want not in ("cuda", "neuron", "cpu", "auto"):
+        raise ValueError(f"device must be cuda|neuron|cpu|auto, got {want!r}")
+    if want != "auto":
+        return want
+    try:
+        import torch_neuronx  # noqa: F401  (registers the "neuron" device)
+        import torch as _t
+        if hasattr(_t, "neuron") and _t.neuron.device_count() > 0:
+            return "neuron"
+    except Exception:
+        pass
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def resolve_distributed():
     """Multi-node topology from the environment (Pattern C — HyperPod multi-node FSDP2).
 
@@ -356,6 +388,9 @@ def build_command(hp):
 
     num_gpus = resolve_num_gpus(hp)
     dist = resolve_distributed()
+    device = resolve_device(hp)
+    if device == "neuron" and dist:
+        raise ValueError("device=neuron is single-node only in this release (no multi-node)")
     if dist:
         # Pattern C — multi-node FSDP2 via accelerate (NO lerobot fork: accelerate natively
         # does multi-node + FSDP, and lerobot auto-detects the accelerate context exactly as
@@ -381,6 +416,12 @@ def build_command(hp):
             "--fsdp_state_dict_type=SHARDED_STATE_DICT",
             "-m", "lerobot.scripts.lerobot_train",
         ]
+    elif device == "neuron" and num_gpus > 1:
+        # Data parallel over NeuronCores: torchrun starts one process per core; accelerate
+        # (>= 1.15) sees WORLD_SIZE > 1 + a neuron device and picks MULTI_NEURON with the
+        # "neuron" torch.distributed backend. neuron_shim pins each rank to its LOCAL_RANK core.
+        # num_gpus here = number of NeuronCores (logical, LNC=2 -> 64 on trn2.48xlarge).
+        launcher = ["torchrun", "--standalone", f"--nproc_per_node={num_gpus}", "-m", "neuron_shim"]
     elif num_gpus > 1:
         # accelerate launch --multi_gpu --num_processes=N --mixed_precision=bf16 \
         #     -m lerobot.scripts.lerobot_train ...
@@ -392,6 +433,10 @@ def build_command(hp):
             "--mixed_precision=bf16",
             "-m", "lerobot.scripts.lerobot_train",
         ]
+    elif device == "neuron":
+        # lerobot rejects unknown device names; neuron_shim teaches it "neuron" and then
+        # runs lerobot's own entry point unchanged (see neuron_shim.py).
+        launcher = [sys.executable, "-m", "neuron_shim"]
     else:
         launcher = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
 
@@ -400,7 +445,7 @@ def build_command(hp):
         "--dataset.repo_id=local",
         f"--dataset.root={dataset_root}",
         f"--policy.type={policy_type}",
-        "--policy.device=cuda",
+        f"--policy.device={device}",
         "--policy.push_to_hub=false",
         f"--output_dir={output_dir}",
         f"--job_name={hp.get('job_name', 'vla_ft')}",

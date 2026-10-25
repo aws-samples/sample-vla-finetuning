@@ -8,6 +8,7 @@ fail=0
 for t in \
   containers/vla-ft/test_vla_ft_decide.py \
   containers/vla-ft/test_train_resume.py \
+  containers/vla-ft/test_train_device.py \
   containers/vla-ft/test_dcp_checkpoint.py \
   containers/isaac-lab-rl/test_rl_liveness_guard.py \
   containers/vla-rl/test_vla_rl_launch.py \

@@ -32,6 +32,7 @@ REGION="${AWS_REGION:-us-west-2}"
 REPO="pai/vla-ft"    # SharedBaseStack ECR repo (namePrefix 'pai' + '/vla-ft')
 TAG="latest"
 MODE="codebuild"   # codebuild (default) | local
+DOCKERFILE="Dockerfile"   # file under docker/ (Dockerfile.neuron = experimental Trainium image)
 ENABLE_EFA=0       # 0 = single-node image (default); 1 = EFA/NCCL fabric overlay for Pattern C
 
 while [ $# -gt 0 ]; do
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
     # --efa builds the multi-node fabric image (EFA installer 1.47.0 + GDRCopy 2.5.1 +
     # aws-ofi-nccl, gated by the Dockerfile's ENABLE_EFA ARG). Default tag flips to ':efa'
     # so the verified single-node ':latest' image is never overwritten by a fabric build.
+    --dockerfile) DOCKERFILE="$2"; shift 2;;
     --efa)    ENABLE_EFA=1; [ "$TAG" = "latest" ] && TAG="efa"; shift;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
@@ -63,7 +65,7 @@ REPO_SLUG="${REPO//\//-}"   # pai/vla-ft -> pai-vla-ft
 # gitsha is the build.sh repo HEAD (the image's only source is docker/Dockerfile, tracked
 # here); '-dirty' marks an uncommitted Dockerfile so a pinned tag never claims a clean commit.
 GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo nogit)"
-if ! git -C "$SCRIPT_DIR" diff --quiet -- docker/Dockerfile 2>/dev/null; then GIT_SHA="${GIT_SHA}-dirty"; fi
+if ! git -C "$SCRIPT_DIR" diff --quiet -- "docker/${DOCKERFILE}" 2>/dev/null; then GIT_SHA="${GIT_SHA}-dirty"; fi
 BUILD_DATE="$(date -u +%Y%m%d)"
 IMMUTABLE_TAG="${TAG}-${BUILD_DATE}-${GIT_SHA}"
 IMMUTABLE_URI="${ECR}/${REPO}:${IMMUTABLE_TAG}"
@@ -110,7 +112,7 @@ if [ "$MODE" = "local" ]; then
   # Tag the SAME build with both the mutable handle and the immutable provenance tag, then
   # push both (same manifest → same digest, two names pointing at it).
   docker build --platform linux/amd64 --build-arg ENABLE_EFA="${ENABLE_EFA}" \
-    -t "$URI" -t "$IMMUTABLE_URI" -f "${SCRIPT_DIR}/docker/Dockerfile" "${SCRIPT_DIR}/docker"
+    -t "$URI" -t "$IMMUTABLE_URI" -f "${SCRIPT_DIR}/docker/${DOCKERFILE}" "${SCRIPT_DIR}/docker"
   docker push "$URI"
   docker push "$IMMUTABLE_URI"
   print_pushed "local"
@@ -134,7 +136,10 @@ if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
       "Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]
     }' >/dev/null
 fi
-aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name "${REPO_SLUG}-build-policy" \
+# The role is global (IAM) but the policy is region-scoped, so the policy NAME carries the
+# region: a build in a second region must ADD its grants, not overwrite the first region's
+# (a single shared name made a us-east-2 build silently revoke us-west-2's log/ECR access).
+aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name "${REPO_SLUG}-build-policy-${REGION}" \
   --policy-document "{
     \"Version\":\"2012-10-17\",
     \"Statement\":[
@@ -151,7 +156,7 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name "${REPO_SLUG}-bui
 
 # 2. Package source (Dockerfile only — no COPY in it) and upload to the CDK bucket.
 TMP_ZIP="$(mktemp -d)/source.zip"
-( cd "${SCRIPT_DIR}/docker" && zip -q "$TMP_ZIP" Dockerfile )
+( T="$(mktemp -d)"; cp "${SCRIPT_DIR}/docker/${DOCKERFILE}" "$T/Dockerfile" && cd "$T" && zip -q "$TMP_ZIP" Dockerfile )
 aws s3 cp "$TMP_ZIP" "s3://${SRC_BUCKET}/${SRC_KEY}" --region "$REGION" >/dev/null
 echo "Source uploaded: s3://${SRC_BUCKET}/${SRC_KEY}"
 
