@@ -205,20 +205,26 @@ pinned to its `LOCAL_RANK` core. Multi-node neuron is refused. The held-out vali
 still runs on CUDA/CPU. The container needs `--ulimit memlock=-1 --cap-add IPC_LOCK`
 (otherwise "Failed to copy data to Neuron device").
 
-Measured 2026-10-25 (SmolVLA from `lerobot/smolvla_base`, `lerobot/svla_so100_pickplace`,
-batch 8 per device, eager mode, steady state after the first-step compile of ~110 s):
+Measured 2026-10-25/28 (SmolVLA from `lerobot/smolvla_base`, `lerobot/svla_so100_pickplace`,
+steady state after the first-step compile). samples/s = effective batch / (update + data time):
 
-| Setup | Effective batch | step/s | samples/s | Final loss |
-|---|---|---|---|---|
-| g6e.4xlarge (1x L40S, cuda) | 8 | 5.2 | ~42 | ~0.14 (1000 steps) |
-| trn2.48xlarge, 1 NeuronCore | 8 | 1.05 | ~8 | 0.137 (1000 steps) |
-| trn2.48xlarge, 8 NeuronCores | 64 | ~0.94 | ~60 | 0.143 (300 steps) |
-| trn2.48xlarge, 64 NeuronCores | 512 | ~0.75 | ~380 | 0.135 (300 steps) |
+| Setup | Mode | Batch per device | Effective batch | samples/s | $ per 1M samples |
+|---|---|---|---|---|---|
+| g6e.4xlarge (1x L40S) | cuda | 8 | 8 | ~42 | ~$20 |
+| trn2.48xlarge, 64 NeuronCores | eager | 8 | 512 | ~380 | ~$26 |
+| trn2.48xlarge, 64 NeuronCores | eager | 32 | 2048 | ~620 | ~$16 |
+| trn2.48xlarge, 64 NeuronCores | eager | 48 | 3072 | ~530 | ~$19 |
+| trn2.48xlarge, 64 NeuronCores | `policy.compile_model=true` | 32 | 2048 | ~980 | ~$10 |
 
-Loss curves match the CUDA run. Cost per 1M samples, using the Capacity Block price
-paid ($858.26 / 24 h) and g6e.4xlarge on-demand ($3.00/h): Trainium 64 cores ~$26,
-L40S ~$20 (the GPU run at batch 8 may not saturate the L40S). Trainium is ~9x faster
-in wall time. Known risks: lerobot caps `torch<2.12` (the Neuron image overrides it to
+Trainium price = Capacity Block ($35.7/h; trn2 has no on-demand price). Eager step time barely
+moves with batch at small batch (0.9-1.3 s/step for 8 per core), i.e. it is dispatch-bound:
+use batch 32 per core and `policy.compile_model=true` (neuron_shim routes `torch.compile` to the
+`neuron` backend with static shapes, and keeps the Beta-distribution sampling and the SmolVLM
+vision position-id scatter eager because they have no Neuron lowering). Batch 64 per core runs
+out of HBM (24 GB per logical core). At compile b32 the CPU data loader is ~22% of step time.
+The L40S row is batch 8 only; a larger-batch L40S baseline was not measured yet (no L40S
+capacity in us-east-2/us-west-2 at the time). Loss curves match the CUDA run.
+Known risks: lerobot caps `torch<2.12` (the Neuron image overrides it to
 2.14), `torch.compile` on Neuron needs static shapes, and ops without a Neuron lowering
 fall back to CPU with only a warning.
 Unit test: `python3 test_train_device.py`.

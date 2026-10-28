@@ -64,6 +64,42 @@ def _load_file(filename, device="cpu", *args, **kwargs):
 
 _st.load_file = _load_file
 
+# lerobot compiles with torch.compile(fn, mode="max-autotune") = the inductor backend, which
+# cannot target Neuron. On a neuron run, route every torch.compile to TorchNeuron's graph
+# backend with static shapes (Neuron compiles one graph per shape) and drop inductor-only modes.
+_orig_compile = torch.compile
+
+
+def _neuron_compile(model=None, *args, **kwargs):
+    kwargs.pop("mode", None)
+    kwargs.pop("options", None)
+    kwargs["backend"] = "neuron"
+    kwargs["dynamic"] = False
+    if model is None:
+        return lambda m: _orig_compile(m, *args, **kwargs)
+    return _orig_compile(model, *args, **kwargs)
+
+
+torch.compile = _neuron_compile
+
+# SmolVLA draws its flow-matching time from a Beta distribution inside forward(); the
+# Dirichlet sampler behind it has no Torch-MLIR -> StableHLO lowering, so the whole graph
+# fails to compile. Keep only the sampling eager (a graph break) and compile the rest.
+import torch.distributions as _td
+
+for _cls in (_td.Beta, _td.Dirichlet):
+    for _name in ("sample", "rsample"):
+        setattr(_cls, _name, torch._dynamo.disable(getattr(_cls, _name)))
+
+# SmolVLM's vision position ids use a boolean-mask scatter (data-dependent shape), which a
+# static Neuron graph cannot express. Run that small embedding step eager as well.
+try:
+    from transformers.models.smolvlm import modeling_smolvlm as _sv
+
+    _sv.SmolVLMVisionEmbeddings.forward = torch._dynamo.disable(_sv.SmolVLMVisionEmbeddings.forward)
+except ImportError:
+    pass
+
 # Under torchrun each rank must own one NeuronCore before accelerate/lerobot touch the device.
 import os as _os
 
