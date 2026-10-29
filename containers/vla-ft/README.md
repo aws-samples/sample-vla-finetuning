@@ -211,6 +211,8 @@ steady state after the first-step compile). samples/s = effective batch / (updat
 | Setup | Mode | Batch per device | Effective batch | samples/s | $ per 1M samples |
 |---|---|---|---|---|---|
 | g6e.4xlarge (1x L40S) | cuda | 8 | 8 | ~42 | ~$20 |
+| g6e.4xlarge (1x L40S) | cuda | 32 | 32 | ~66 | ~$12.6 |
+| g6e.4xlarge (1x L40S) | cuda | 64 | 64 | ~67 | ~$12.4 |
 | trn2.48xlarge, 64 NeuronCores | eager | 8 | 512 | ~380 | ~$26 |
 | trn2.48xlarge, 64 NeuronCores | eager | 32 | 2048 | ~620 | ~$16 |
 | trn2.48xlarge, 64 NeuronCores | eager | 48 | 3072 | ~530 | ~$19 |
@@ -222,8 +224,9 @@ use batch 32 per core and `policy.compile_model=true` (neuron_shim routes `torch
 `neuron` backend with static shapes, and keeps the Beta-distribution sampling and the SmolVLM
 vision position-id scatter eager because they have no Neuron lowering). Batch 64 per core runs
 out of HBM (24 GB per logical core). At compile b32 the CPU data loader is ~22% of step time.
-The L40S row is batch 8 only; a larger-batch L40S baseline was not measured yet (no L40S
-capacity in us-east-2/us-west-2 at the time). Loss curves match the CUDA run.
+The L40S saturates at ~67 samples/s from batch 32 up (GPU rows are eager, no torch.compile;
+g6e.4xlarge on-demand $3.00/h). Best-vs-best: Trainium compile b32 ~$10 vs L40S ~$12.4 per
+1M samples (~19% cheaper) and ~15x the throughput per instance. Loss curves match the CUDA run.
 Known risks: lerobot caps `torch<2.12` (the Neuron image overrides it to
 2.14), `torch.compile` on Neuron needs static shapes, and ops without a Neuron lowering
 fall back to CPU with only a warning.
