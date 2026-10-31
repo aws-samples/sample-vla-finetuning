@@ -225,8 +225,32 @@ use batch 32 per core and `policy.compile_model=true` (neuron_shim routes `torch
 vision position-id scatter eager because they have no Neuron lowering). Batch 64 per core runs
 out of HBM (24 GB per logical core). At compile b32 the CPU data loader is ~22% of step time.
 The L40S saturates at ~67 samples/s from batch 32 up (GPU rows are eager, no torch.compile;
-g6e.4xlarge on-demand $3.00/h). Best-vs-best: Trainium compile b32 ~$10 vs L40S ~$12.4 per
-1M samples (~19% cheaper) and ~15x the throughput per instance. Loss curves match the CUDA run.
+g6e.4xlarge on-demand $3.00/h). Steady-state best-vs-best: Trainium compile b32 ~$10 vs L40S
+~$12.4 per 1M samples (~19% cheaper) and ~15x the throughput per instance. Loss curves match the
+CUDA run.
+
+The steady-state table hides per-job fixed time and the billing model. One 1M-sample job end to
+end (measured 2026-10-28 logs):
+
+| | Trainium compile b32 (64 cores) | L40S batch 64 |
+|---|---|---|
+| Training | ~17 min | ~4 h 09 min |
+| Fixed per job | ~12 min (boot + image pull ~6, first-step compile ~5, load/save ~1.5) | ~8 min (boot + image pull, no compile) |
+| Wall clock | ~29 min | ~4 h 17 min |
+| Cost at hourly rate | ~$17.3 | ~$12.9 |
+
+So a single 1M-sample job finishes ~9x sooner on Trainium but costs ~35% more; Trainium is
+cheaper per job only above ~3M samples. The hourly rate also assumes the Capacity Block is kept
+busy: a block (~20.6 h for $736 here) beats L40S only if ~59M samples (~82% of its ~72M capacity)
+run inside it; one 1M job on its own block costs the whole block.
+
+Samples are not the unit of work either: final loss tracks optimizer steps (LR schedule), not
+samples. L40S batch 32 reached loss 0.147 after 300 steps (~10K samples, ~2.4 min of training);
+Trainium reached 0.138 after 200 steps of global batch 2048 (~410K samples). At equal samples the
+two run very different step counts (1M samples = ~15.6K steps at batch 64 vs ~490 at 2048), so
+compare on task success (sim eval), not samples. lerobot's SmolVLA fine-tune recipe is batch 64 x
+20K steps. For SmolVLA-size models the L40S is the cost-effective default; Trainium fits larger
+models, long multi-hour runs, or many jobs packed into one block.
 Known risks: lerobot caps `torch<2.12` (the Neuron image overrides it to
 2.14), `torch.compile` on Neuron needs static shapes, and ops without a Neuron lowering
 fall back to CPU with only a warning.
